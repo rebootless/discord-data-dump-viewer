@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Discord JSON Export Viewer (PyQt6) with DM vs Server Filtering
-==============================================================
+Discord JSON Export Viewer (PyQt6) with DM/Server + Attachments Filters
+=======================================================================
 
-This program is designed for the Discord export folder layout you described.
+Designed for your Discord export folder layout:
 
-Expected top-level structure (example):
     discord/
         Account/
         Activities/
@@ -24,17 +23,17 @@ Expected top-level structure (example):
 
 We only care about the `Messages/` folder:
 
-- `Messages/index.json`:
-    A single JSON object mapping channel IDs -> human-readable labels.
+- `Messages/index.json`
+    JSON object mapping channel IDs -> human-readable labels.
 
-    Example entries (based on your sample):
+    Example entries:
         "848195446115270716": "dev-help in KiCad EDA"
         "148549792191086593": "casual-chatter in AMD Gaming"
         "1412883475043979344": "Direct Message with harleylynn43#0"
         ...
 
-- `Messages/<channel_id>/messages.json`:
-    A JSON array of message objects. Example (based on your sample):
+- `Messages/<channel_id>/messages.json`
+    JSON array of message objects, e.g.:
 
         [
             {
@@ -52,43 +51,38 @@ We only care about the `Messages/` folder:
             ...
         ]
 
-New feature in this version
----------------------------
-We classify each channel as:
+Features
+--------
+- Choose the Discord export root (the folder that contains `Messages/`).
+- Automatically detect `Messages/` folder and load `Messages/index.json`.
+- Discover all `Messages/<channel_id>/messages.json`.
 
-- "dm"      = Private Message
-- "server"  = Server channel / everything else
+Channel classification & filters:
+- Each channel is classified as:
+    * "dm"      -> label starts with "Direct Message with ..."
+    * "server"  -> everything else
+- Left side UI:
+    * Filter: [ All | Private Messages | Server Channels ]
+    * Checkbox: [x] Only channels with attachments
+        -> Only shows channels where at least one message has non-empty `Attachments`.
 
-Classification rule:
-    If the label from Messages/index.json begins with "Direct Message with"
-    (case-insensitive), we treat it as a DM.
-    Otherwise, we treat it as a server channel.
+Message-level filters:
+- Top-right UI:
+    * Search box -> filters by `Contents` (case-insensitive).
+    * Checkbox: [x] Only messages with attachments
+        -> Filters current channel’s messages down to those with non-empty `Attachments`.
 
-The UI adds a filter at the top-left:
+Message view:
+- Table columns:
+    [ ID | Timestamp | Contents | Attachments? ]
+- Click a row -> bottom-right shows pretty-printed JSON of that message.
 
-    Show: [ All | Private Messages | Server Channels ]
-
-The channel list updates when you change this filter.
-
-Main GUI:
----------
-- Left:
-    * Filter combo box (All / Private Messages / Server Channels)
-    * List of channels matching the filter.
-- Right:
-    * Top:
-        - Search bar (filters messages by Contents, case-insensitive)
-        - Table of messages with columns:
-            [ ID | Timestamp | Contents | Attachments? ]
-    * Bottom:
-        - Full pretty-printed JSON of the selected message.
-
-Dependencies:
--------------
+Dependencies
+------------
 - Python 3.9+
 - PyQt6
 
-Install PyQt6 (if needed):
+Install PyQt6 if needed:
     pip install PyQt6
 """
 
@@ -120,73 +114,70 @@ from PyQt6.QtWidgets import (
     QToolBar,
     QSizePolicy,
     QComboBox,
+    QCheckBox,
 )
 
 
-# Type aliases for clarity and readability
 JsonObject = Dict[str, Any]
 JsonArray = List[Any]
 
 
 class DiscordExportViewer(QMainWindow):
     """
-    Main window for the Discord export viewer.
+    Main window for the Discord export viewer with:
 
-    New in this version:
-    --------------------
-    - Channels are classified as "dm" (private messages) or "server"
-      (server channels / everything else).
-    - A combo box lets you filter the visible channels by:
-        * All
-        * Private Messages
-        * Server Channels
+    - Channel filters:
+        * All / Private Messages / Server Channels
+        * Only channels with attachments
+    - Message filters:
+        * Search in contents
+        * Only messages with attachments
     """
 
     def __init__(self) -> None:
         super().__init__()
 
-        # ---------- Basic window config ----------
-        self.setWindowTitle("Discord JSON Export Viewer (Messages + DM/Server Filter)")
+        # ---- Window basics ----
+        self.setWindowTitle(
+            "Discord JSON Export Viewer "
+            "(Messages + DM/Server + Attachments Filters)"
+        )
         self.resize(1400, 900)
 
-        # ---------- Internal state: paths ----------
-        # Root folder chosen by the user (the one that contains Messages/)
-        self.root_folder: Optional[str] = None
+        # ---- Path state ----
+        self.root_folder: Optional[str] = None         # user-chosen root
+        self.messages_root: Optional[str] = None       # actual Messages/ root
+        self.messages_index_path: Optional[str] = None # Messages/index.json
 
-        # Messages root folder we operate on (usually "<root>/Messages")
-        self.messages_root: Optional[str] = None
-
-        # Path to Messages/index.json (if found)
-        self.messages_index_path: Optional[str] = None
-
-        # ---------- Internal state: channel / message data ----------
+        # ---- Channel/message data ----
         # channel_index: channel_id -> label from Messages/index.json
         self.channel_index: Dict[str, str] = {}
 
-        # channel_entries: list of dicts, each representing a channel:
-        #   {
-        #       "id":   channel_id (str),
-        #       "label":human-friendly name (str),
-        #       "path": full path to messages.json,
-        #       "kind": "dm" or "server"
-        #   }
+        # channel_entries: each is a dict:
+        # {
+        #   "id":   channel_id (str),
+        #   "label":human-readable label (str),
+        #   "path": messages.json path (str),
+        #   "kind":"dm" or "server",
+        #   "has_attachments": "yes" / "no"
+        # }
         self.channel_entries: List[Dict[str, str]] = []
 
-        # Currently loaded messages for the selected channel
+        # For current selected channel:
         self.current_messages_unfiltered: List[JsonObject] = []
         self.current_messages: List[JsonObject] = []
 
-        # Current channel filter: "all", "dm", or "server"
+        # Channel filter mode: "all", "dm", or "server"
         self.current_channel_filter: str = "all"
 
-        # ---------- Build the UI ----------
+        # ---- Build UI ----
         self._init_menu_bar()
         self._init_toolbar()
         self._init_central_widgets()
         self._init_status_bar()
 
     # ======================================================================
-    # UI construction helpers
+    # UI construction
     # ======================================================================
 
     def _init_menu_bar(self) -> None:
@@ -213,37 +204,25 @@ class DiscordExportViewer(QMainWindow):
         open_folder_action.triggered.connect(self.choose_root_folder)
 
     def _init_central_widgets(self) -> None:
-        """
-        Build the central layout:
-
-        - Left:  filter combo + channel list
-        - Right: vertical splitter with:
-            * Top:    search + message table
-            * Bottom: details JSON view
-        """
+        """Build the main central layout."""
         central = QWidget(self)
         self.setCentralWidget(central)
 
         main_layout = QHBoxLayout()
         central.setLayout(main_layout)
 
-        # ====================== LEFT SIDE ======================
+        # ---------------------- LEFT SIDE ----------------------
         left_panel = QWidget()
         left_layout = QVBoxLayout()
         left_panel.setLayout(left_layout)
 
-        # --- Channel filter row: "Show: [ All | Private | Server ]" ---
+        # Channel type filter (All / Private Messages / Server Channels)
         filter_layout = QHBoxLayout()
         filter_label = QLabel("Show:")
         self.channel_filter_combo = QComboBox()
         self.channel_filter_combo.addItems(
             ["All", "Private Messages", "Server Channels"]
         )
-
-        # Map combo box index to internal filter keys:
-        # 0 -> "all"
-        # 1 -> "dm"
-        # 2 -> "server"
         self.channel_filter_combo.currentIndexChanged.connect(
             self.on_channel_filter_changed
         )
@@ -251,10 +230,18 @@ class DiscordExportViewer(QMainWindow):
         filter_layout.addWidget(filter_label)
         filter_layout.addWidget(self.channel_filter_combo)
         filter_layout.addStretch(1)
-
         left_layout.addLayout(filter_layout)
 
-        # --- Channel list widget ---
+        # Channel attachments-only filter
+        self.channel_attachments_only_checkbox = QCheckBox(
+            "Only channels with attachments"
+        )
+        self.channel_attachments_only_checkbox.toggled.connect(
+            self.on_channel_attachments_filter_changed
+        )
+        left_layout.addWidget(self.channel_attachments_only_checkbox)
+
+        # Channel list
         self.channel_list_widget = QListWidget()
         self.channel_list_widget.setSelectionMode(
             QListWidget.SelectionMode.SingleSelection
@@ -264,23 +251,20 @@ class DiscordExportViewer(QMainWindow):
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Expanding,
         )
-
-        # When user selects a channel, load its messages
         self.channel_list_widget.itemSelectionChanged.connect(
             self.on_channel_selected
         )
-
         left_layout.addWidget(self.channel_list_widget)
 
-        # ====================== RIGHT SIDE ======================
+        # ---------------------- RIGHT SIDE ----------------------
         right_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # ---- TOP: search + messages table ----
+        # ---------- TOP: search + messages table ----------
         upper_panel = QWidget()
         upper_layout = QVBoxLayout()
         upper_panel.setLayout(upper_layout)
 
-        # Search controls
+        # Search row
         search_layout = QHBoxLayout()
         search_label = QLabel("Search in message contents:")
         self.search_line_edit = QLineEdit()
@@ -298,6 +282,15 @@ class DiscordExportViewer(QMainWindow):
         search_layout.addWidget(search_button)
         search_layout.addWidget(clear_search_button)
 
+        # Message attachments-only checkbox (message-level filter)
+        self.message_attachments_only_checkbox = QCheckBox(
+            "Only messages with attachments"
+        )
+        self.message_attachments_only_checkbox.toggled.connect(
+            self.on_message_attachments_filter_changed
+        )
+        search_layout.addWidget(self.message_attachments_only_checkbox)
+
         upper_layout.addLayout(search_layout)
 
         # Messages table
@@ -306,22 +299,18 @@ class DiscordExportViewer(QMainWindow):
         self.messages_table.setHorizontalHeaderLabels(
             ["ID", "Timestamp", "Contents", "Attachments?"]
         )
-
         self.messages_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
         )
         self.messages_table.setSelectionMode(
             QTableWidget.SelectionMode.SingleSelection
         )
-
-        # Show message JSON when selecting a row
         self.messages_table.itemSelectionChanged.connect(
             self.on_message_selected
         )
-
         upper_layout.addWidget(self.messages_table)
 
-        # ---- BOTTOM: message JSON details ----
+        # ---------- BOTTOM: JSON details ----------
         self.details_text_edit = QTextEdit()
         self.details_text_edit.setReadOnly(True)
         self.details_text_edit.setLineWrapMode(
@@ -330,19 +319,17 @@ class DiscordExportViewer(QMainWindow):
 
         right_splitter.addWidget(upper_panel)
         right_splitter.addWidget(self.details_text_edit)
-
         right_splitter.setStretchFactor(0, 3)
         right_splitter.setStretchFactor(1, 2)
 
-        # ====================== ADD LEFT + RIGHT TO MAIN LAYOUT ======================
+        # ---------------------- ADD LEFT + RIGHT ----------------------
         main_layout.addWidget(left_panel)
         main_layout.addWidget(right_splitter)
-
-        main_layout.setStretch(0, 1)  # left
-        main_layout.setStretch(1, 3)  # right
+        main_layout.setStretch(0, 1)
+        main_layout.setStretch(1, 3)
 
     def _init_status_bar(self) -> None:
-        """Create the status bar."""
+        """Create a status bar for feedback messages."""
         status_bar = QStatusBar(self)
         self.setStatusBar(status_bar)
         self.show_status_message("Ready.")
@@ -352,11 +339,7 @@ class DiscordExportViewer(QMainWindow):
     # ======================================================================
 
     def show_status_message(self, message: str, timeout_ms: int = 5000) -> None:
-        """
-        Display a message in the status bar for `timeout_ms` ms.
-
-        If timeout_ms == 0, the message persists until replaced.
-        """
+        """Show a message in the status bar."""
         if self.statusBar():
             self.statusBar().showMessage(message, timeout_ms)
 
@@ -365,18 +348,13 @@ class DiscordExportViewer(QMainWindow):
     # ======================================================================
 
     def choose_root_folder(self) -> None:
-        """
-        Let the user pick the Discord export root folder (the one that
-        contains the Messages/ folder).
-        """
+        """Prompt the user to select the Discord export root folder."""
         folder = QFileDialog.getExistingDirectory(
             self,
             "Select Discord Export Folder",
             self.root_folder or os.path.expanduser("~"),
         )
-
         if not folder:
-            # User cancelled
             return
 
         self.root_folder = folder
@@ -384,14 +362,13 @@ class DiscordExportViewer(QMainWindow):
 
     def scan_export_structure(self) -> None:
         """
-        Given self.root_folder, determine the Messages root, load index.json,
-        discover all messages.json files, classify them as DM vs Server,
-        and populate the channel list according to the current filter.
+        Given self.root_folder, determine Messages root, load index.json,
+        discover channels + classify them, then populate channel list.
         """
         if not self.root_folder:
             return
 
-        # Clear prior state
+        # Reset state
         self.messages_root = None
         self.messages_index_path = None
         self.channel_index.clear()
@@ -402,15 +379,15 @@ class DiscordExportViewer(QMainWindow):
 
         root = self.root_folder
 
-        # -- 1) Find "Messages" root folder --
+        # 1) Find Messages root
         guessed_messages_root: Optional[str] = None
 
-        # Case A: root has a "Messages" subfolder
+        # Case A: root/Messages exists
         possible_messages = os.path.join(root, "Messages")
         if os.path.isdir(possible_messages):
             guessed_messages_root = possible_messages
         else:
-            # Case B: root itself might BE the Messages folder
+            # Case B: user might have picked Messages itself
             for dirpath, _, filenames in os.walk(root):
                 if any(fname.lower() == "messages.json" for fname in filenames):
                     guessed_messages_root = root
@@ -420,17 +397,16 @@ class DiscordExportViewer(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Messages Folder Not Found",
-                "I could not find a 'Messages' folder or any 'messages.json' "
+                "Could not find a 'Messages' folder or any 'messages.json'\n"
                 "files under the selected directory.\n\n"
-                "Please select your Discord export folder (the one that "
-                "contains a 'Messages' subfolder).",
+                "Please select your Discord export folder.",
             )
             self.show_status_message("Messages root not found.")
             return
 
         self.messages_root = guessed_messages_root
 
-        # -- 2) Load Messages/index.json if present --
+        # 2) Load Messages/index.json if present
         index_path = os.path.join(self.messages_root, "index.json")
         if os.path.isfile(index_path):
             self.messages_index_path = index_path
@@ -444,14 +420,16 @@ class DiscordExportViewer(QMainWindow):
                 "Channel labels will be shown as raw channel IDs.",
             )
 
-        # -- 3) Discover and classify Messages/<channel_id>/messages.json --
-        self.channel_entries = self._discover_and_classify_channels(self.messages_root)
+        # 3) Discover channels + classify DM/Server + detect attachments
+        self.channel_entries = self._discover_and_classify_channels(
+            self.messages_root
+        )
 
-        # -- 4) Populate the channel list based on the current filter (default: all) --
+        # 4) Populate channel list based on filters
         self.populate_channel_list()
 
         self.show_status_message(
-            f"Found {len(self.channel_entries)} channels in '{self.messages_root}'."
+            f"Found {len(self.channel_entries)} channels under '{self.messages_root}'."
         )
 
         if not self.channel_entries:
@@ -466,9 +444,7 @@ class DiscordExportViewer(QMainWindow):
     # ======================================================================
 
     def _load_messages_index(self, index_path: str) -> None:
-        """
-        Load Messages/index.json into self.channel_index (channel_id -> label).
-        """
+        """Load Messages/index.json into self.channel_index."""
         try:
             with open(index_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -484,38 +460,27 @@ class DiscordExportViewer(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Unexpected index.json Structure",
-                "Messages/index.json is not a JSON object at the top level.\n"
-                "Channel names may not display correctly.",
+                "Messages/index.json is not a JSON object at the top level.",
             )
             return
 
-        # Normalize keys & values to strings
         self.channel_index = {str(k): str(v) for k, v in data.items()}
-
         self.show_status_message(
             f"Loaded Messages/index.json from '{index_path}'.", timeout_ms=7000
         )
 
     # ======================================================================
-    # Discover and classify channels (DM vs Server)
+    # Discover & classify channels
     # ======================================================================
 
     def _discover_and_classify_channels(self, messages_root: str) -> List[Dict[str, str]]:
         """
-        Walk the Messages root and find each messages.json.
-
-        For each one:
-            channel_id = parent folder name
-            label      = channel_index.get(channel_id, f"{channel_id} (unknown)")
-            kind       = "dm" or "server" determined from label
-
-        Return a list of dicts:
-            {
-                "id":   channel_id,
-                "label":label,
-                "path": messages_json_path,
-                "kind": "dm" | "server"
-            }
+        Walk Messages root for any messages.json.
+        For each:
+            - channel_id = parent folder name
+            - label      = index.json label or "<id> (unknown)"
+            - kind       = "dm" or "server"
+            - has_attachments = "yes" if any message in that file has attachments
         """
         entries: List[Dict[str, str]] = []
 
@@ -525,15 +490,14 @@ class DiscordExportViewer(QMainWindow):
                     continue
 
                 messages_path = os.path.join(dirpath, fname)
-
-                # Parent directory name is the channel ID
                 parent_dir = os.path.dirname(messages_path)
                 channel_id = os.path.basename(parent_dir)
 
-                # Get label from index if possible
-                label = self.channel_index.get(channel_id, f"{channel_id} (unknown)")
-
+                label = self.channel_index.get(
+                    channel_id, f"{channel_id} (unknown)"
+                )
                 kind = self._classify_channel_kind(label)
+                has_att = "yes" if self._channel_has_attachments(messages_path) else "no"
 
                 entries.append(
                     {
@@ -541,48 +505,72 @@ class DiscordExportViewer(QMainWindow):
                         "label": label,
                         "path": messages_path,
                         "kind": kind,
+                        "has_attachments": has_att,
                     }
                 )
 
-        # For stable / nice ordering, sort by label then by id
+        # Sort by label then id
         entries.sort(key=lambda e: (e["label"].lower(), e["id"]))
-
         return entries
 
     @staticmethod
     def _classify_channel_kind(label: str) -> str:
         """
-        Determine whether a channel is a "dm" or a "server" channel.
-
-        Heuristic:
-            - If label starts with "Direct Message with" (case-insensitive),
-              treat as a DM.
-            - Otherwise, treat as a server channel.
-
-        This is based on how your Messages/index.json describes DMs, e.g.:
-            "Direct Message with harleylynn43#0"
-            "Direct Message with Unknown Participant"
+        Label-based classification:
+            - If label starts with 'Direct Message with' (case-insensitive)
+              -> treat as DM.
+            - Otherwise -> server channel.
         """
         normalized = label.strip().lower()
         if normalized.startswith("direct message with"):
             return "dm"
-        # Fallback: all else is considered "server" / non-DM
         return "server"
 
+    def _channel_has_attachments(self, messages_path: str) -> bool:
+        """
+        Determine whether a channel has at least one message
+        with non-empty 'Attachments'.
+
+        We load the JSON file once here and short-circuit as soon
+        as we find an attachment.
+        """
+        try:
+            with open(messages_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            # If something goes wrong, assume no attachments to be safe.
+            return False
+
+        if not isinstance(data, list):
+            return False
+
+        for msg in data:
+            if not isinstance(msg, dict):
+                continue
+            attachments = msg.get("Attachments", "")
+            attachments_str = str(attachments).strip() if attachments is not None else ""
+            if attachments_str:
+                return True
+
+        return False
+
     # ======================================================================
-    # Channel list population and filtering
+    # Channel list population & filters
     # ======================================================================
 
     def populate_channel_list(self) -> None:
-        """
-        Fill the left-hand channel list widget with channels matching the
-        current channel filter (all, dm, or server).
-        """
+        """Populate the channel list widget based on the current filters."""
         self.channel_list_widget.clear()
 
+        attachments_only = self.channel_attachments_only_checkbox.isChecked()
+
         for entry in self.channel_entries:
-            kind = entry["kind"]
-            if self.current_channel_filter != "all" and kind != self.current_channel_filter:
+            # Filter by kind: all / dm / server
+            if self.current_channel_filter != "all" and entry["kind"] != self.current_channel_filter:
+                continue
+
+            # Filter by "Only channels with attachments"
+            if attachments_only and entry["has_attachments"] != "yes":
                 continue
 
             channel_id = entry["id"]
@@ -591,19 +579,16 @@ class DiscordExportViewer(QMainWindow):
 
             display_text = f"{label} [{channel_id}]"
             item = QListWidgetItem(display_text)
-            # Store (channel_id, path) in user data for retrieval
             item.setData(Qt.ItemDataRole.UserRole, (channel_id, path))
-
             self.channel_list_widget.addItem(item)
 
     def on_channel_filter_changed(self, index: int) -> None:
         """
-        Called when the combo box for channel filtering changes.
+        Called when the "Show: All / Private / Server" combo changes.
 
-        Mapping:
-            index 0 -> "all"
-            index 1 -> "dm"
-            index 2 -> "server"
+        0 -> all
+        1 -> dm
+        2 -> server
         """
         if index == 1:
             self.current_channel_filter = "dm"
@@ -612,33 +597,35 @@ class DiscordExportViewer(QMainWindow):
         else:
             self.current_channel_filter = "all"
 
-        # Rebuild the channel list to respect the new filter
         self.populate_channel_list()
-
-        # Clear messages & details when filter changes (optional but less confusing)
         self.clear_messages()
         self.details_text_edit.clear()
         self.show_status_message(
-            f"Channel filter changed: {self.current_channel_filter}"
+            f"Channel filter changed to: {self.current_channel_filter}"
         )
+
+    def on_channel_attachments_filter_changed(self, checked: bool) -> None:
+        """Called when 'Only channels with attachments' is toggled."""
+        self.populate_channel_list()
+        self.clear_messages()
+        self.details_text_edit.clear()
+        if checked:
+            self.show_status_message("Showing only channels with attachments.")
+        else:
+            self.show_status_message("Showing channels with or without attachments.")
 
     # ======================================================================
     # Channel selection -> load messages
     # ======================================================================
 
     def on_channel_selected(self) -> None:
-        """
-        Triggered when a user selects a channel in the channel list.
-
-        Loads that channel's messages.json and updates the table + details.
-        """
+        """Load messages for the channel selected in the list."""
         selected_items = self.channel_list_widget.selectedItems()
         if not selected_items:
             return
 
         item = selected_items[0]
         data = item.data(Qt.ItemDataRole.UserRole)
-
         if not isinstance(data, tuple) or len(data) != 2:
             return
 
@@ -647,21 +634,13 @@ class DiscordExportViewer(QMainWindow):
 
     def load_channel_messages(self, channel_id: str, messages_path: str) -> None:
         """
-        Load all messages from the given messages.json for a channel.
-
-        Steps:
-            1. Clear current messages and details.
-            2. Load JSON from messages_path.
-            3. Verify it is a list.
-            4. Store into current_messages_unfiltered/current_messages.
-            5. Populate the messages table.
-            6. Show a helpful hint in the details pane.
+        Load Messages/<channel_id>/messages.json and apply message-level filters.
         """
         self.clear_messages()
         self.details_text_edit.clear()
-        self.search_line_edit.clear()
+        # Keep any previous attachment-only setting & search text;
+        # filters will be re-applied to this new channel.
 
-        # Load JSON
         try:
             with open(messages_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -685,15 +664,13 @@ class DiscordExportViewer(QMainWindow):
             self.show_status_message("Unexpected messages.json format.")
             return
 
-        # Keep only dict-like entries
         messages = [m for m in data if isinstance(m, dict)]
-
         self.current_messages_unfiltered = messages
-        self.current_messages = list(messages)  # shallow copy for filtering
+        self.current_messages = list(messages)
 
-        self.populate_messages_table()
+        # Apply message-level filters (search + attachments)
+        self.apply_message_filters(from_search=False)
 
-        # Friendly label for status bar / hint
         label = self.channel_index.get(channel_id, f"{channel_id} (unknown)")
         self.show_status_message(
             f"Loaded {len(messages)} messages from channel: {label} [{channel_id}]",
@@ -704,30 +681,24 @@ class DiscordExportViewer(QMainWindow):
             f"Channel: {label} [{channel_id}]\n"
             f"Messages file: {messages_path}\n"
             f"Total messages loaded: {len(messages)}\n\n"
-            "Select a row in the table above to view the full JSON for that message."
+            "Use the search and 'Only messages with attachments' checkbox "
+            "to filter. Select a row in the table above to view the full JSON "
+            "for that message."
         )
         self.details_text_edit.setPlainText(hint_text)
 
     # ======================================================================
-    # Messages table population / clearing
+    # Messages table population & helpers
     # ======================================================================
 
     def clear_messages(self) -> None:
-        """Clear the message lists and the table contents."""
+        """Clear in-memory messages and wipe the table."""
         self.current_messages_unfiltered = []
         self.current_messages = []
         self.messages_table.setRowCount(0)
 
     def populate_messages_table(self) -> None:
-        """
-        Fill the QTableWidget with rows from self.current_messages.
-
-        Columns:
-            0: ID
-            1: Timestamp
-            2: Contents
-            3: Attachments? ("Yes"/"No")
-        """
+        """Fill the message table with self.current_messages."""
         messages = self.current_messages
         self.messages_table.setRowCount(len(messages))
 
@@ -742,7 +713,6 @@ class DiscordExportViewer(QMainWindow):
             contents_item = QTableWidgetItem(contents)
             att_item = QTableWidgetItem(attachments_flag)
 
-            # Make cells non-editable
             for item in (id_item, ts_item, contents_item, att_item):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
@@ -753,47 +723,35 @@ class DiscordExportViewer(QMainWindow):
 
         self.messages_table.resizeColumnsToContents()
 
-    # ======================================================================
-    # Message field extractors
-    # ======================================================================
+    # ---- Field extractors ----
 
     @staticmethod
     def _extract_message_id(msg: JsonObject) -> str:
-        """Return the message 'ID' as a string (or empty string if missing)."""
         val = msg.get("ID")
         return str(val) if val is not None else ""
 
     @staticmethod
     def _extract_message_timestamp(msg: JsonObject) -> str:
-        """Return the 'Timestamp' field as a string (or empty string)."""
         ts = msg.get("Timestamp")
         return str(ts) if ts is not None else ""
 
     @staticmethod
     def _extract_message_contents(msg: JsonObject) -> str:
-        """Return the 'Contents' field as a string (or empty string)."""
         contents = msg.get("Contents", "")
         return str(contents) if contents is not None else ""
 
     @staticmethod
     def _extract_attachments_flag(msg: JsonObject) -> str:
-        """
-        Determine "Yes"/"No" based on whether 'Attachments' contains
-        any non-empty text.
-        """
         attachments = msg.get("Attachments", "")
         attachments_str = str(attachments).strip() if attachments is not None else ""
         return "Yes" if attachments_str else "No"
 
     # ======================================================================
-    # Row selection -> show full message JSON
+    # Message selection -> JSON detail
     # ======================================================================
 
     def on_message_selected(self) -> None:
-        """
-        Called when the selection in the messages table changes.
-        Shows pretty-printed JSON for the selected message.
-        """
+        """Show full JSON for the selected message in the details panel."""
         selected_items = self.messages_table.selectedItems()
         if not selected_items:
             return
@@ -803,7 +761,6 @@ class DiscordExportViewer(QMainWindow):
             return
 
         msg = self.current_messages[row]
-
         try:
             pretty = json.dumps(msg, indent=4, ensure_ascii=False)
         except Exception as exc:
@@ -812,49 +769,87 @@ class DiscordExportViewer(QMainWindow):
         self.details_text_edit.setPlainText(pretty)
 
     # ======================================================================
-    # Search / filter messages by contents
+    # Message-level filters: search + attachments-only
     # ======================================================================
 
-    def on_search_clicked(self) -> None:
+    def apply_message_filters(self, from_search: bool = False) -> None:
         """
-        Filter current_messages_unfiltered into current_messages based on
-        substring match in the 'Contents' field (case-insensitive), and
-        repopulate the table.
+        Apply message-level filters to current_messages_unfiltered and
+        store result into current_messages, then populate the table.
+
+        Filters:
+            - Search in 'Contents' (case-insensitive).
+            - Only messages with attachments, if checkbox is checked.
         """
         if not self.current_messages_unfiltered:
+            self.messages_table.setRowCount(0)
             return
 
         query = self.search_line_edit.text().strip()
-        if not query:
-            # Empty query => show all
-            self.current_messages = list(self.current_messages_unfiltered)
-            self.populate_messages_table()
-            self.show_status_message("Search cleared; showing all messages.")
-            return
-
         query_lower = query.lower()
+        attachments_only = self.message_attachments_only_checkbox.isChecked()
+
         filtered: List[JsonObject] = []
 
         for msg in self.current_messages_unfiltered:
-            contents = self._extract_message_contents(msg).lower()
-            if query_lower in contents:
-                filtered.append(msg)
+            # Attachments filter
+            if attachments_only and self._extract_attachments_flag(msg) != "Yes":
+                continue
+
+            # Search filter
+            if query_lower:
+                contents = self._extract_message_contents(msg).lower()
+                if query_lower not in contents:
+                    continue
+
+            filtered.append(msg)
 
         self.current_messages = filtered
         self.populate_messages_table()
 
-        self.show_status_message(
-            f"Search '{query}': {len(filtered)} messages matched.",
-            timeout_ms=8000,
-        )
+        # Status bar messaging
+        if query_lower:
+            self.show_status_message(
+                f"Filters: search='{query}', attachments_only={attachments_only} "
+                f"-> {len(filtered)} messages.",
+                timeout_ms=8000,
+            )
+        else:
+            if attachments_only:
+                self.show_status_message(
+                    f"Filter: attachments_only={attachments_only} "
+                    f"-> {len(filtered)} messages.",
+                    timeout_ms=8000,
+                )
+            else:
+                if from_search:
+                    # Search button with empty query
+                    self.show_status_message(
+                        "Search cleared; showing all messages.", timeout_ms=5000
+                    )
+                else:
+                    # Generic case (e.g., channel load without filters)
+                    self.show_status_message(
+                        f"Showing all {len(filtered)} messages (no filters).",
+                        timeout_ms=5000,
+                    )
+
+    def on_search_clicked(self) -> None:
+        """Triggered by Search button: apply message filters."""
+        self.apply_message_filters(from_search=True)
 
     def on_clear_search_clicked(self) -> None:
-        """Clear search field and restore unfiltered messages."""
+        """Clear search text and re-apply filters (attachments-only might still be on)."""
         self.search_line_edit.clear()
-        if self.current_messages_unfiltered:
-            self.current_messages = list(self.current_messages_unfiltered)
-            self.populate_messages_table()
-            self.show_status_message("Search cleared; showing all messages.")
+        self.apply_message_filters(from_search=True)
+
+    def on_message_attachments_filter_changed(self, checked: bool) -> None:
+        """Triggered when 'Only messages with attachments' is toggled."""
+        self.apply_message_filters(from_search=False)
+        if checked:
+            self.show_status_message("Showing only messages with attachments.")
+        else:
+            self.show_status_message("Showing messages with or without attachments.")
 
     # ======================================================================
     # End of class
