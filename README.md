@@ -164,6 +164,8 @@ Contains:
 
 ## 6. Using the Application
 
+![alt text](img/demo1.png "GUI Render")
+
 ### 6.1 Load Export Folder
 Select **File → Open Export Folder**.
 
