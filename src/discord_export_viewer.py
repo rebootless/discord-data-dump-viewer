@@ -3,10 +3,10 @@
 Discord JSON Export Viewer (PyQt6)
 ==================================
 
-This script is a fairly full-featured viewer for a Discord data export
-with the folder layout you described. It focuses primarily on the
-"Messages" portion of the export, but also has an experimental feature
-to show metadata from "Activities" / "Activity" folders.
+This script is a full-featured viewer for a Discord data export with
+the folder layout you described. It focuses primarily on the "Messages"
+portion of the export, but also has an experimental feature to show
+metadata from "Activities" / "Activity" folders.
 
 Expected (simplified) folder layout
 -----------------------------------
@@ -36,19 +36,20 @@ discord/
         ... (not used directly by this viewer)
     README.txt
 
-What we do with it
-------------------
+What we use from it
+-------------------
 We only *require* the "Messages" folder and its index:
 
 - Messages/index.json
-    A JSON object mapping channel IDs to human-readable labels.
+    JSON object mapping channel IDs to human-readable labels.
     Example entries:
         "848195446115270716": "dev-help in KiCad EDA"
         "148549792191086593": "casual-chatter in AMD Gaming"
         "1412883475043979344": "Direct Message with harleylynn43#0"
 
 - Messages/<channel_id>/messages.json
-    A JSON array of message objects. Based on your sample:
+    JSON array of message objects, e.g.:
+
         [
             {
                 "ID": 870521199048929300,
@@ -65,10 +66,16 @@ We only *require* the "Messages" folder and its index:
             ...
         ]
 
-Classification:
-- A channel is classified as:
-    - "dm"     if its label starts with "Direct Message with" (case insensitive)
-    - "server" otherwise
+Channel classification
+----------------------
+Each channel is classified as:
+
+- "dm"
+    if its label (from Messages/index.json) starts with
+    "Direct Message with" (case-insensitive).
+
+- "server"
+    otherwise (server channels, group chats, etc.).
 
 BIG PICTURE FEATURES
 --------------------
@@ -77,73 +84,71 @@ LEFT SIDE (Channels)
 - Filters:
     - Show: [ All | Private Messages | Server Channels ]
     - [x] Only channels with attachments
-- Sorting buttons:
+- Sorting:
     - Channels A→Z
     - Channels Z→A
 - Channel list:
-    - Each entry = one messages.json file
+    - Each entry corresponds to one messages.json file.
     - Displayed as: "<label from index.json> [<channel_id>]"
 
 RIGHT TOP (Messages in selected channel)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-- Search bar for current channel:
-    - Case-insensitive substring search on "Contents"
+- Search bar for current channel.
+- `Search across ALL channels` checkbox:
+    - OFF → Search filters the **current channel** (table).
+    - ON  → Search runs a **global search across all channels** and opens
+            a results dialog.
 - Buttons:
-    - Search                -> apply message filters
-    - Clear                 -> clear search text & reapply filters
-    - Search ALL Channels   -> global search (see below)
+    - Search         -> runs local or global search depending on checkbox
+    - Clear          -> clears search text and reapplies local filters
 - Checkboxes:
     - [x] Only messages with attachments
     - [x] Use Activities metadata (experimental)
-- Sorting buttons:
+- Sorting:
     - Time ↑ (sort by Timestamp ascending)
     - Time ↓ (sort by Timestamp descending)
+- Export (current channel, filtered messages):
+    - Export CSV
+    - Export Markdown
 - Messages table:
-    - Columns: [ ID | Timestamp | Contents | Attachments? ("Yes"/"No") ]
-    - Single selection (row)
-    - Double-click behavior:
-        - If you double-click on the "Attachments?" column and it says "Yes",
-          a dialog appears listing all URLs. You can double-click URLs to open
-          them in your default browser, or click a button to open all.
+    - Columns: [ ID | Timestamp | Contents | Attachments? ]
+    - Double-click on "Attachments?" where value is "Yes":
+        → Attachment viewer dialog showing URLs; can open in browser.
 
 RIGHT BOTTOM (Message details)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-- Shows pretty-printed JSON for the selected message.
-- If "Use Activities metadata (experimental)" is checked:
-    - The viewer scans "Activities/" and "Activity/" for JSON files.
-    - It tries to extract timestamps from events (very generic heuristic).
-    - For each selected message, any events whose date string matches the
-      message's date (first 10 chars of Timestamp) are appended at the bottom
-      of the details view under:
-          --- Activities metadata (experimental) ---
+- Pretty-printed JSON for the selected message.
+- When Activities metadata is enabled:
+    - Scans "Activities/" and "Activity/" for JSON-ish data.
+    - Naively correlates events by date (YYYY-MM-DD) with message Timestamp.
+    - Appends related events to the details view.
 
 GLOBAL SEARCH (ALL channels)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-- Uses the text in the same search field.
-- Scans *every* messages.json under Messages/.
-- Looks for case-insensitive matches in "Contents".
-- Results dialog shows:
-    - Columns: [ Channel | ID | Timestamp | Contents | Attachments? ]
-    - Table is sortable
-    - Double-clicking a row:
-        -> jumps the main window to that channel
-        -> selects the corresponding message
-
-EXPORT FEATURES
-~~~~~~~~~~~~~~~
-- Export current (filtered) messages table to:
-    - CSV
-    - Markdown
-- Export global search results to:
-    - CSV
-    - Markdown
+- Triggered when:
+    - You press Search with `Search across ALL channels` checkbox ON.
+- Scans **all message JSONs** under Messages/ (DMs + servers).
+- Case-insensitive substring match on "Contents".
+- Results dialog:
+    - Columns:
+        [ Channel | Type | ID | Timestamp | Contents | Attachments? ]
+      where Type is "Server" or "Direct Message".
+    - Header label shows:
+        - Total matches
+        - How many in servers vs how many in direct messages.
+    - Table is sortable.
+    - Double-click a row:
+        → Jumps main window to that channel and selects that message.
+    - Exports:
+        - Export results to CSV
+        - Export results to Markdown
 
 Implementation notes
 --------------------
-- Written for Python 3.9+ (should also work on newer versions).
+- Python 3.9+ recommended.
 - Requires PyQt6:
       pip install PyQt6
-- Uses Python's built-in csv and webbrowser modules.
+- Uses built-in `csv` and `webbrowser` modules.
 """
 
 import csv
@@ -178,11 +183,9 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QCheckBox,
     QDialog,
-    QTableWidgetSelectionRange,
 )
 
 
-# Type aliases to keep things readable
 JsonObject = Dict[str, Any]
 JsonArray = List[Any]
 
@@ -193,12 +196,14 @@ JsonArray = List[Any]
 
 class AttachmentViewerDialog(QDialog):
     """
-    A small dialog that shows a list of attachment URLs for a message.
+    Dialog for displaying and opening attachment URLs associated with a message.
 
-    - Displayed as a simple multi-line text area.
-    - "Open Selected" button opens the first selected line (if any) in the
-      default web browser.
-    - "Open All" button attempts to open every URL.
+    - Shows one URL per line in a read-only text box.
+    - Double-click a line to open that URL in the default web browser.
+    - "Open Selected" button:
+        opens the URL under the text cursor.
+    - "Open All" button:
+        attempts to open all URLs.
     """
 
     def __init__(self, parent: QWidget, urls: List[str]) -> None:
@@ -212,14 +217,12 @@ class AttachmentViewerDialog(QDialog):
         layout = QVBoxLayout()
         self.setLayout(layout)
 
-        # Informational label
         info_label = QLabel(
-            "Attachment URLs (double-click a line to open it, "
-            "or use the buttons below):"
+            "Attachment URLs "
+            "(double-click a line to open it, or use the buttons below):"
         )
         layout.addWidget(info_label)
 
-        # Simple read-only text area showing one URL per line
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
         self.text_edit.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
@@ -243,14 +246,13 @@ class AttachmentViewerDialog(QDialog):
 
         layout.addLayout(buttons_layout)
 
-        # Double-click to open
+        # Override mouseDoubleClickEvent on the text edit
         self.text_edit.mouseDoubleClickEvent = self._on_text_double_click
 
     def _on_text_double_click(self, event) -> None:
         """
-        Override mouse double-click event on the QTextEdit to open the URL
-        under the cursor, if we can identify a line corresponding to one
-        of the stored URLs.
+        Double-click on the QTextEdit:
+        try to open the URL on the line under the mouse cursor.
         """
         cursor = self.text_edit.cursorForPosition(event.position().toPoint())
         cursor.select(cursor.SelectionType.LineUnderCursor)
@@ -259,7 +261,7 @@ class AttachmentViewerDialog(QDialog):
             self._open_url(line_text)
 
     def _open_url(self, url: str) -> None:
-        """Open a URL in the default web browser."""
+        """Open the given URL in the default browser, with basic error handling."""
         try:
             webbrowser.open(url)
         except Exception as exc:
@@ -271,8 +273,8 @@ class AttachmentViewerDialog(QDialog):
 
     def open_selected(self) -> None:
         """
-        Open the URL(s) currently selected in the text widget.
-        For simplicity, we grab the line under the cursor.
+        Open the URL on the line where the cursor is currently located.
+        This uses the text cursor in the QTextEdit.
         """
         cursor = self.text_edit.textCursor()
         cursor.select(cursor.SelectionType.LineUnderCursor)
@@ -288,7 +290,7 @@ class AttachmentViewerDialog(QDialog):
         self._open_url(line_text)
 
     def open_all(self) -> None:
-        """Open all stored URLs in the default web browser."""
+        """Open all stored URLs in the default browser."""
         if not self.urls:
             QMessageBox.information(
                 self,
@@ -302,26 +304,35 @@ class AttachmentViewerDialog(QDialog):
 
 
 # ======================================================================
-# Global search results dialog
+# Global search dialog
 # ======================================================================
 
 class GlobalSearchDialog(QDialog):
     """
-    Dialog that displays global search results (across all channels)
-    in a table and allows:
+    Dialog for displaying global search results (across all channels).
 
-    - Double-click a row -> jump to that channel/message in main viewer.
-    - Export all results to CSV or Markdown.
-
-    Each result is a dict with at least:
+    Each result is a dict containing, at minimum:
         {
             "channel_id": "...",
             "channel_label": "...",
+            "channel_kind": "dm" or "server",
             "ID": ...,
             "Timestamp": "...",
             "Contents": "...",
-            "has_attachments": bool
+            "has_attachments": bool,
         }
+
+    UI:
+    - Table with columns:
+        [ Channel | Type | ID | Timestamp | Contents | Attachments? ]
+      where Type is "Server" or "Direct Message".
+    - Header label summarizing:
+        - Total matches
+        - How many in servers vs DMs.
+    - Double-click a row -> calls back to main viewer to jump to message.
+    - Export buttons:
+        - Export CSV
+        - Export Markdown
     """
 
     def __init__(
@@ -333,7 +344,7 @@ class GlobalSearchDialog(QDialog):
     ) -> None:
         super().__init__(parent, *args, **kwargs)
         self.setWindowTitle("Global Search Results")
-        self.resize(1200, 600)
+        self.resize(1300, 600)
 
         self.parent_viewer = parent
         self.results = results
@@ -341,14 +352,22 @@ class GlobalSearchDialog(QDialog):
         layout = QVBoxLayout()
         self.setLayout(layout)
 
-        label = QLabel(f"Global search results: {len(results)} messages found.")
+        # Compute stats: total, server, dm
+        total = len(results)
+        dm_count = sum(1 for r in results if r.get("channel_kind") == "dm")
+        server_count = total - dm_count
+
+        label = QLabel(
+            f"Global search results: {total} messages found "
+            f"(Servers: {server_count}, Direct Messages: {dm_count})."
+        )
         layout.addWidget(label)
 
-        # Table of results
+        # Results table
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
+        self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(
-            ["Channel", "ID", "Timestamp", "Contents", "Attachments?"]
+            ["Channel", "Type", "ID", "Timestamp", "Contents", "Attachments?"]
         )
         self.table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
@@ -360,7 +379,7 @@ class GlobalSearchDialog(QDialog):
         self.table.cellDoubleClicked.connect(self.on_row_double_clicked)
         layout.addWidget(self.table)
 
-        # Buttons row for export + close
+        # Export + close buttons
         buttons_layout = QHBoxLayout()
         self.btn_export_csv = QPushButton("Export CSV")
         self.btn_export_md = QPushButton("Export Markdown")
@@ -374,51 +393,64 @@ class GlobalSearchDialog(QDialog):
         buttons_layout.addWidget(self.btn_export_md)
         buttons_layout.addStretch(1)
         buttons_layout.addWidget(self.btn_close)
-
         layout.addLayout(buttons_layout)
 
         self.populate_table()
 
     def populate_table(self) -> None:
-        """Fill the results table."""
+        """Fill the table with the global search results."""
         self.table.setRowCount(len(self.results))
 
         for row, res in enumerate(self.results):
             channel_label = res.get("channel_label", "")
             channel_id = res.get("channel_id", "")
+            kind = res.get("channel_kind", "server")
             msg_id = str(res.get("ID", ""))
             timestamp = str(res.get("Timestamp", ""))
             contents = str(res.get("Contents", ""))
             attachments_flag = "Yes" if res.get("has_attachments", False) else "No"
 
+            # Channel cell text: label [id]
             channel_text = f"{channel_label} [{channel_id}]"
-
             channel_item = QTableWidgetItem(channel_text)
+
+            # Type cell: "Server" vs "Direct Message"
+            type_text = "Direct Message" if kind == "dm" else "Server"
+            type_item = QTableWidgetItem(type_text)
+
             id_item = QTableWidgetItem(msg_id)
             ts_item = QTableWidgetItem(timestamp)
             contents_item = QTableWidgetItem(contents)
             att_item = QTableWidgetItem(attachments_flag)
 
-            # Store (channel_id, message_id) for jump on double-click
+            # Store (channel_id, message_id) in the ID item for jumping
             id_item.setData(Qt.ItemDataRole.UserRole, (channel_id, msg_id))
 
-            for item in (channel_item, id_item, ts_item, contents_item, att_item):
+            for item in (
+                channel_item,
+                type_item,
+                id_item,
+                ts_item,
+                contents_item,
+                att_item,
+            ):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
             self.table.setItem(row, 0, channel_item)
-            self.table.setItem(row, 1, id_item)
-            self.table.setItem(row, 2, ts_item)
-            self.table.setItem(row, 3, contents_item)
-            self.table.setItem(row, 4, att_item)
+            self.table.setItem(row, 1, type_item)
+            self.table.setItem(row, 2, id_item)
+            self.table.setItem(row, 3, ts_item)
+            self.table.setItem(row, 4, contents_item)
+            self.table.setItem(row, 5, att_item)
 
         self.table.resizeColumnsToContents()
 
     def on_row_double_clicked(self, row: int, column: int) -> None:
         """
-        On double-click, find the (channel_id, message_id) for that row and
-        instruct the main viewer to jump there.
+        On double-click, retrieve (channel_id, message_id) from the row and
+        ask the main viewer to jump there.
         """
-        id_item = self.table.item(row, 1)  # ID column
+        id_item = self.table.item(row, 2)  # ID column
         if id_item is None:
             return
 
@@ -433,7 +465,7 @@ class GlobalSearchDialog(QDialog):
     # ---- Export helpers ----
 
     def export_csv(self) -> None:
-        """Export all results to a CSV file via a file-save dialog."""
+        """Export global search results to CSV."""
         if not self.results:
             QMessageBox.information(self, "Export CSV", "No results to export.")
             return
@@ -450,28 +482,47 @@ class GlobalSearchDialog(QDialog):
         try:
             with open(path, "w", encoding="utf-8", newline="") as f:
                 writer = csv.writer(f)
-                # Header
-                writer.writerow(["Channel", "Channel ID", "ID", "Timestamp", "Contents", "Attachments?"])
-                # Rows
+                # Header row
+                writer.writerow(
+                    [
+                        "Channel",
+                        "Channel ID",
+                        "Type",
+                        "Message ID",
+                        "Timestamp",
+                        "Contents",
+                        "Attachments?",
+                    ]
+                )
+
+                # Data rows
                 for res in self.results:
                     channel_label = res.get("channel_label", "")
                     channel_id = res.get("channel_id", "")
+                    kind = res.get("channel_kind", "server")
+                    type_text = "Direct Message" if kind == "dm" else "Server"
                     msg_id = str(res.get("ID", ""))
                     timestamp = str(res.get("Timestamp", ""))
                     contents = str(res.get("Contents", ""))
-                    attachments_flag = "Yes" if res.get("has_attachments", False) else "No"
-                    writer.writerow([
-                        channel_label,
-                        channel_id,
-                        msg_id,
-                        timestamp,
-                        contents,
-                        attachments_flag,
-                    ])
+                    attachments_flag = (
+                        "Yes" if res.get("has_attachments", False) else "No"
+                    )
+                    writer.writerow(
+                        [
+                            channel_label,
+                            channel_id,
+                            type_text,
+                            msg_id,
+                            timestamp,
+                            contents,
+                            attachments_flag,
+                        ]
+                    )
+
             QMessageBox.information(
                 self,
                 "Export CSV",
-                f"Global search results successfully exported to:\n{path}",
+                f"Global search results exported to:\n{path}",
             )
         except Exception as exc:
             QMessageBox.critical(
@@ -481,7 +532,7 @@ class GlobalSearchDialog(QDialog):
             )
 
     def export_markdown(self) -> None:
-        """Export all results to a Markdown file (simple table)."""
+        """Export global search results to a Markdown table."""
         if not self.results:
             QMessageBox.information(self, "Export Markdown", "No results to export.")
             return
@@ -498,23 +549,38 @@ class GlobalSearchDialog(QDialog):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("# Global Search Results\n\n")
-                f.write("| Channel | Channel ID | Message ID | Timestamp | Attachments? | Contents |\n")
-                f.write("|---------|------------|------------|-----------|--------------|----------|\n")
+                f.write(
+                    "| Channel | Channel ID | Type | Message ID | Timestamp | "
+                    "Attachments? | Contents |\n"
+                )
+                f.write(
+                    "|---------|------------|------|------------|-----------|"
+                    "--------------|----------|\n"
+                )
+
                 for res in self.results:
                     channel_label = res.get("channel_label", "")
                     channel_id = res.get("channel_id", "")
+                    kind = res.get("channel_kind", "server")
+                    type_text = "Direct Message" if kind == "dm" else "Server"
                     msg_id = str(res.get("ID", ""))
                     timestamp = str(res.get("Timestamp", ""))
-                    contents = str(res.get("Contents", "")).replace("\n", " ").replace("|", "\\|")
-                    attachments_flag = "Yes" if res.get("has_attachments", False) else "No"
-                    f.write(
-                        f"| {channel_label} | {channel_id} | {msg_id} | "
-                        f"{timestamp} | {attachments_flag} | {contents} |\n"
+                    contents = str(res.get("Contents", ""))
+                    contents = contents.replace("\n", " ").replace("|", "\\|")
+                    attachments_flag = (
+                        "Yes" if res.get("has_attachments", False) else "No"
                     )
+
+                    f.write(
+                        f"| {channel_label} | {channel_id} | {type_text} | "
+                        f"{msg_id} | {timestamp} | {attachments_flag} | "
+                        f"{contents} |\n"
+                    )
+
             QMessageBox.information(
                 self,
                 "Export Markdown",
-                f"Global search results successfully exported to:\n{path}",
+                f"Global search results exported to:\n{path}",
             )
         except Exception as exc:
             QMessageBox.critical(
@@ -530,87 +596,70 @@ class GlobalSearchDialog(QDialog):
 
 class DiscordExportViewer(QMainWindow):
     """
-    Main window that lets you navigate Discord messages by channel,
-    filter, search, export, and (optionally) cross-reference with
-    Activities/Activity metadata.
+    Main application window:
 
-    Major responsibilities:
-    - Discover & classify channels under Messages/ (DM vs server).
-    - Load messages for a selected channel.
-    - Apply message-level filters (search, attachments-only).
-    - Support channel-level filters (DM/server, channels with attachments).
-    - Provide global search across all channels.
-    - Provide export to CSV/Markdown for:
-        - current channel (filtered messages)
-        - global search results (via dialog)
-    - When Activities integration is enabled:
-        - Parse JSON-like events under "Activities/" and "Activity/".
-        - Attempt a naive timestamp correlation:
-            - For each message, show events whose date (first 10 chars) matches
-              the message's date.
+    - Discovers channels from Messages/.
+    - Filters & displays channels (All / DM / Server, with attachments-only).
+    - Loads messages for selected channel & displays them in a table.
+    - Local search (current channel) vs global search (all channels) using
+      a `Search across ALL channels` checkbox.
+    - Shows full JSON for the selected message.
+    - Attachment viewer dialog for "Attachments?" == "Yes".
+    - Experimental Activities/Activity metadata correlation.
+    - Export of filtered current-channel messages to CSV/Markdown.
     """
 
     def __init__(self) -> None:
         super().__init__()
 
-        # ---------- Window basics ----------
+        # ---- Window basics ----
         self.setWindowTitle(
             "Discord JSON Export Viewer "
-            "(Messages + DM/Server + Attachments + Global Search + Activities)"
+            "(Messages + DM/Server + Global Search + Activities)"
         )
         self.resize(1600, 900)
 
-        # ---------- Path / root state ----------
+        # ---- Path / root state ----
         self.root_folder: Optional[str] = None
         self.messages_root: Optional[str] = None
         self.messages_index_path: Optional[str] = None
 
-        # ---------- Channel / message state ----------
-        self.channel_index: Dict[str, str] = {}  # channel_id -> label
+        # ---- Channel state ----
+        # channel_index: channel_id -> human-readable label
+        self.channel_index: Dict[str, str] = {}
 
         # channel_entries: list of dicts:
         # {
         #   "id": channel_id,
-        #   "label": human-readable label,
-        #   "path": messages_json_path,
+        #   "label": human-readable,
+        #   "path": messages.json path,
         #   "kind": "dm" or "server",
-        #   "has_attachments": "yes"/"no",
+        #   "has_attachments": "yes" or "no",
         # }
         self.channel_entries: List[Dict[str, str]] = []
 
-        # For currently selected channel:
+        # Filter mode for channels: "all", "dm", "server"
+        self.current_channel_filter: str = "all"
+
+        # ---- Current channel messages ----
         self.current_messages_unfiltered: List[JsonObject] = []
         self.current_messages: List[JsonObject] = []
 
-        # Channel filter mode: "all", "dm", "server"
-        self.current_channel_filter: str = "all"
-
-        # ---------- Activities metadata state ----------
-        # If True, message details will attempt to show related events
-        # from Activities/Activity.
+        # ---- Activities metadata state ----
         self.activities_enabled: bool = False
+        self.activities_events: List[Dict[str, Any]] = []  # flattened events
 
-        # Flattened list of parsed events from Activities/Activity (if any).
-        # Each event is a dict with at least:
-        #    {
-        #        "timestamp": "YYYY-MM-DD..." (string),
-        #        "source_file": "<path>",
-        #        "raw": <original JSON object>
-        #    }
-        self.activities_events: List[Dict[str, Any]] = []
-
-        # ---------- Build UI ----------
+        # ---- Build the UI ----
         self._init_menu_bar()
         self._init_toolbar()
         self._init_central_widgets()
         self._init_status_bar()
 
     # ------------------------------------------------------------------
-    # UI construction helpers
+    # UI setup
     # ------------------------------------------------------------------
 
     def _init_menu_bar(self) -> None:
-        """Create the menu bar with File actions."""
         menu_bar = QMenuBar(self)
         self.setMenuBar(menu_bar)
 
@@ -625,7 +674,6 @@ class DiscordExportViewer(QMainWindow):
         exit_action.triggered.connect(self.close)
 
     def _init_toolbar(self) -> None:
-        """Simple toolbar with an 'Open Folder' button."""
         toolbar = QToolBar("Main Toolbar", self)
         self.addToolBar(toolbar)
 
@@ -634,12 +682,15 @@ class DiscordExportViewer(QMainWindow):
 
     def _init_central_widgets(self) -> None:
         """
-        Build main central layout:
+        Compose the main layout:
 
-        - Left: channel filters + channel list
-        - Right: vertical splitter:
-            * Top: search + filter + sort + message table
-            * Bottom: JSON details (plus optional activities metadata)
+        LEFT:
+            - Channel filters and channel list.
+
+        RIGHT:
+            - Vertical splitter with:
+                * Top: search / filters / sort / export / messages table.
+                * Bottom: JSON details for selected message.
         """
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -647,12 +698,12 @@ class DiscordExportViewer(QMainWindow):
         main_layout = QHBoxLayout()
         central.setLayout(main_layout)
 
-        # ================= LEFT SIDE (channels) =================
+        # ================= LEFT SIDE =================
         left_panel = QWidget()
         left_layout = QVBoxLayout()
         left_panel.setLayout(left_layout)
 
-        # ---- Channel type filter: All / Private / Server ----
+        # Channel type filter (All / Private / Server)
         filter_layout = QHBoxLayout()
         filter_label = QLabel("Show:")
         self.channel_filter_combo = QComboBox()
@@ -668,7 +719,7 @@ class DiscordExportViewer(QMainWindow):
         filter_layout.addStretch(1)
         left_layout.addLayout(filter_layout)
 
-        # ---- Channel attachments-only filter ----
+        # Channel attachments-only checkbox
         self.channel_attachments_only_checkbox = QCheckBox(
             "Only channels with attachments"
         )
@@ -677,7 +728,7 @@ class DiscordExportViewer(QMainWindow):
         )
         left_layout.addWidget(self.channel_attachments_only_checkbox)
 
-        # ---- Channel sorting buttons ----
+        # Channel sorting buttons
         channel_sort_layout = QHBoxLayout()
         self.btn_sort_channels_az = QPushButton("Channels A→Z")
         self.btn_sort_channels_za = QPushButton("Channels Z→A")
@@ -687,7 +738,7 @@ class DiscordExportViewer(QMainWindow):
         channel_sort_layout.addWidget(self.btn_sort_channels_za)
         left_layout.addLayout(channel_sort_layout)
 
-        # ---- Channel list widget ----
+        # Channel list widget
         self.channel_list_widget = QListWidget()
         self.channel_list_widget.setSelectionMode(
             QListWidget.SelectionMode.SingleSelection
@@ -702,15 +753,15 @@ class DiscordExportViewer(QMainWindow):
         )
         left_layout.addWidget(self.channel_list_widget)
 
-        # ================= RIGHT SIDE (messages + details) =================
+        # ================= RIGHT SIDE =================
         right_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # ---- TOP: search, filters, sorting, table ----
+        # ---- TOP: search/filters/sort/export/messages table ----
         upper_panel = QWidget()
         upper_layout = QVBoxLayout()
         upper_panel.setLayout(upper_layout)
 
-        # --- Search row (search box, search buttons, attachments filter, global search) ---
+        # Search row
         search_layout = QHBoxLayout()
         search_label = QLabel("Search in message contents:")
         self.search_line_edit = QLineEdit()
@@ -720,18 +771,15 @@ class DiscordExportViewer(QMainWindow):
 
         btn_search = QPushButton("Search")
         btn_clear_search = QPushButton("Clear")
-        btn_search_all = QPushButton("Search ALL Channels")  # global search
-
         btn_search.clicked.connect(self.on_search_clicked)
         btn_clear_search.clicked.connect(self.on_clear_search_clicked)
-        btn_search_all.clicked.connect(self.on_global_search_clicked)
 
         search_layout.addWidget(search_label)
         search_layout.addWidget(self.search_line_edit)
         search_layout.addWidget(btn_search)
         search_layout.addWidget(btn_clear_search)
 
-        # Message-level attachments-only checkbox
+        # Attachments-only (message-level)
         self.message_attachments_only_checkbox = QCheckBox(
             "Only messages with attachments"
         )
@@ -740,34 +788,35 @@ class DiscordExportViewer(QMainWindow):
         )
         search_layout.addWidget(self.message_attachments_only_checkbox)
 
-        # Global search button
-        search_layout.addWidget(btn_search_all)
+        # NEW: Search-scope checkbox (local vs global)
+        self.search_all_channels_checkbox = QCheckBox(
+            "Search across ALL channels"
+        )
+        search_layout.addWidget(self.search_all_channels_checkbox)
 
         upper_layout.addLayout(search_layout)
 
-        # --- Row for message sorting and Activities toggle ---
+        # Message sorting + Activities toggle
         sort_layout = QHBoxLayout()
         sort_label = QLabel("Sort messages by time:")
         self.btn_sort_time_asc = QPushButton("Time ↑")
         self.btn_sort_time_desc = QPushButton("Time ↓")
         self.btn_sort_time_asc.clicked.connect(self.sort_messages_time_asc)
         self.btn_sort_time_desc.clicked.connect(self.sort_messages_time_desc)
-
         sort_layout.addWidget(sort_label)
         sort_layout.addWidget(self.btn_sort_time_asc)
         sort_layout.addWidget(self.btn_sort_time_desc)
 
-        # Activities metadata toggle (experimental)
+        # Activities metadata toggle
         self.activities_checkbox = QCheckBox(
             "Use Activities metadata (experimental)"
         )
         self.activities_checkbox.toggled.connect(self.on_activities_toggle)
         sort_layout.addWidget(self.activities_checkbox)
-
         sort_layout.addStretch(1)
         upper_layout.addLayout(sort_layout)
 
-        # --- Export buttons for current channel ---
+        # Export current-channel messages row
         export_layout = QHBoxLayout()
         self.btn_export_csv = QPushButton("Export Current (Filtered) as CSV")
         self.btn_export_md = QPushButton("Export Current (Filtered) as Markdown")
@@ -778,7 +827,7 @@ class DiscordExportViewer(QMainWindow):
         export_layout.addStretch(1)
         upper_layout.addLayout(export_layout)
 
-        # ---- Messages table ----
+        # Messages table
         self.messages_table = QTableWidget()
         self.messages_table.setColumnCount(4)
         self.messages_table.setHorizontalHeaderLabels(
@@ -792,19 +841,16 @@ class DiscordExportViewer(QMainWindow):
         )
         self.messages_table.setSortingEnabled(True)
 
-        # When selection changes, show JSON detail
         self.messages_table.itemSelectionChanged.connect(
             self.on_message_selected
         )
-
-        # Double-click "Attachments?" -> attachments dialog
         self.messages_table.cellDoubleClicked.connect(
             self.on_message_cell_double_clicked
         )
 
         upper_layout.addWidget(self.messages_table)
 
-        # ---- BOTTOM: JSON details text area ----
+        # ---- BOTTOM: details text (JSON + optional activities) ----
         self.details_text_edit = QTextEdit()
         self.details_text_edit.setReadOnly(True)
         self.details_text_edit.setLineWrapMode(
@@ -816,7 +862,7 @@ class DiscordExportViewer(QMainWindow):
         right_splitter.setStretchFactor(0, 3)
         right_splitter.setStretchFactor(1, 2)
 
-        # ---- Put left and right into main layout ----
+        # Add left + right to main layout
         main_layout.addWidget(left_panel)
         main_layout.addWidget(right_splitter)
         main_layout.setStretch(0, 1)
@@ -836,11 +882,11 @@ class DiscordExportViewer(QMainWindow):
             self.statusBar().showMessage(message, timeout_ms)
 
     # ======================================================================
-    # Folder selection & scanning
+    # Folder selection & initial scan
     # ======================================================================
 
     def choose_root_folder(self) -> None:
-        """Prompt user to select Discord export root folder."""
+        """Prompt user to select the Discord export root folder."""
         folder = QFileDialog.getExistingDirectory(
             self,
             "Select Discord Export Folder",
@@ -854,11 +900,12 @@ class DiscordExportViewer(QMainWindow):
 
     def scan_export_structure(self) -> None:
         """
-        From self.root_folder:
-            - Determine Messages root.
-            - Load Messages/index.json.
-            - Discover channel entries.
-            - (Optionally) scan Activities/Activity for metadata.
+        Once root_folder is chosen:
+
+        - Determine the Messages/ root.
+        - Load Messages/index.json (if present).
+        - Discover all messages.json files as channels.
+        - Optionally scan Activities/Activity for metadata.
         """
         if not self.root_folder:
             return
@@ -875,14 +922,13 @@ class DiscordExportViewer(QMainWindow):
 
         root = self.root_folder
 
-        # 1) Find Messages root
+        # 1) Locate Messages root
         guessed_messages_root: Optional[str] = None
 
         possible_messages = os.path.join(root, "Messages")
         if os.path.isdir(possible_messages):
             guessed_messages_root = possible_messages
         else:
-            # Maybe user picked the Messages dir itself
             for dirpath, _, filenames in os.walk(root):
                 if any(fname.lower() == "messages.json" for fname in filenames):
                     guessed_messages_root = root
@@ -900,7 +946,7 @@ class DiscordExportViewer(QMainWindow):
 
         self.messages_root = guessed_messages_root
 
-        # 2) Load Messages/index.json
+        # 2) Load Messages/index.json (if it exists)
         index_path = os.path.join(self.messages_root, "index.json")
         if os.path.isfile(index_path):
             self.messages_index_path = index_path
@@ -914,19 +960,18 @@ class DiscordExportViewer(QMainWindow):
                 "Channel labels will be shown as raw IDs.",
             )
 
-        # 3) Discover & classify channels
+        # 3) Discover and classify channels
         self.channel_entries = self._discover_and_classify_channels(
             self.messages_root
         )
         self.populate_channel_list()
 
-        # 4) (Optional) scan Activities/Activity for metadata
+        # 4) Scan Activities & Activity for metadata (optional)
         self.scan_activities_metadata()
 
         self.show_status_message(
             f"Found {len(self.channel_entries)} channels under '{self.messages_root}'."
         )
-
         if not self.channel_entries:
             QMessageBox.information(
                 self,
@@ -966,14 +1011,16 @@ class DiscordExportViewer(QMainWindow):
 
     def _discover_and_classify_channels(self, messages_root: str) -> List[Dict[str, str]]:
         """
-        Walk Messages root, find all 'messages.json' files, and for each:
+        Walk the Messages root, find each messages.json, and produce
+        a list of channel entries:
 
-            - Determine channel_id (parent folder name)
-            - Label from index.json (if present)
-            - Classification (dm or server)
-            - Whether channel has any attachments
-
-        Return a list of channel entry dicts.
+            {
+                "id": channel_id,
+                "label": label from index.json or "<id> (unknown)",
+                "path": full path to messages.json,
+                "kind": "dm" or "server",
+                "has_attachments": "yes" or "no",
+            }
         """
         entries: List[Dict[str, str]] = []
 
@@ -1014,7 +1061,7 @@ class DiscordExportViewer(QMainWindow):
         return "server"
 
     def _channel_has_attachments(self, messages_path: str) -> bool:
-        """Return True if any message in that file has a non-empty Attachments field."""
+        """Check if any message in that file has non-empty Attachments."""
         try:
             with open(messages_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -1034,31 +1081,24 @@ class DiscordExportViewer(QMainWindow):
         return False
 
     # ======================================================================
-    # Activities metadata scanning (experimental)
+    # Activities metadata (experimental)
     # ======================================================================
 
     def scan_activities_metadata(self) -> None:
         """
-        Attempt to find and parse JSON-like events under:
-            - <root>/Activities/
-            - <root>/Activity/
+        Look under <root>/Activities/ and <root>/Activity/ for JSON-like data
+        and attempt to extract events with timestamp-ish fields.
 
-        This is intentionally generic and heuristic, because we don't have
-        a strict schema. The goal is:
-
-        - Find JSON files.
-        - For each JSON object/list, look for fields containing something
-          that looks like a timestamp (keys like "timestamp", "time",
-          "created_at", etc.).
-        - For each event, store:
+        The result is stored in self.activities_events as a list of dicts:
             {
                 "timestamp": "<string>",
                 "source_file": "<path>",
-                "raw": <original JSON object>
+                "raw": <original object>,
             }
 
-        The viewer then can match these events to messages by comparing
-        the *date* (first 10 chars) to the message's Timestamp date.
+        When Activities metadata is enabled, the viewer compares the date
+        (YYYY-MM-DD) in each message Timestamp against the date in event
+        timestamps to show "related" events in the details pane.
         """
         self.activities_events.clear()
         if not self.root_folder:
@@ -1073,10 +1113,9 @@ class DiscordExportViewer(QMainWindow):
             candidate_dirs.append(activity_dir)
 
         if not candidate_dirs:
-            # No activities folder present -> nothing to do
             return
 
-        # Basic set of keys we consider "timestamp-like"
+        # Keys that might contain timestamps
         timestamp_keys = {
             "timestamp",
             "time",
@@ -1086,23 +1125,18 @@ class DiscordExportViewer(QMainWindow):
             "date",
         }
 
-        def extract_timestamp_from_obj(obj: Any) -> Optional[str]:
-            """
-            Try to extract a timestamp string from a JSON object (dict),
-            using a list of "timestamp-like" keys.
-            """
+        def extract_ts(obj: Any) -> Optional[str]:
+            """Try to extract a timestamp-like field from a dict."""
             if not isinstance(obj, dict):
                 return None
-            for key, value in obj.items():
-                if key.lower() in timestamp_keys:
-                    # Represent as string
-                    return str(value)
+            for k, v in obj.items():
+                if k.lower() in timestamp_keys:
+                    return str(v)
             return None
 
         for base in candidate_dirs:
             for dirpath, _, filenames in os.walk(base):
                 for fname in filenames:
-                    # Only look at .json-ish files (very coarse filter)
                     if not fname.lower().endswith(".json"):
                         continue
                     full_path = os.path.join(dirpath, fname)
@@ -1112,13 +1146,9 @@ class DiscordExportViewer(QMainWindow):
                     except Exception:
                         continue
 
-                    # data might be:
-                    # - a list of events
-                    # - a dict containing an "events" list
-                    # - a single dict that itself represents an event
                     if isinstance(data, list):
                         for obj in data:
-                            ts = extract_timestamp_from_obj(obj)
+                            ts = extract_ts(obj)
                             if ts:
                                 self.activities_events.append(
                                     {
@@ -1128,12 +1158,11 @@ class DiscordExportViewer(QMainWindow):
                                     }
                                 )
                     elif isinstance(data, dict):
-                        # Check if there is an "events" or similar list
                         found_any = False
-                        for k, v in data.items():
+                        for _, v in data.items():
                             if isinstance(v, list):
                                 for obj in v:
-                                    ts = extract_timestamp_from_obj(obj)
+                                    ts = extract_ts(obj)
                                     if ts:
                                         self.activities_events.append(
                                             {
@@ -1144,8 +1173,7 @@ class DiscordExportViewer(QMainWindow):
                                         )
                                         found_any = True
                         if not found_any:
-                            # Maybe the dict itself is an event
-                            ts = extract_timestamp_from_obj(data)
+                            ts = extract_ts(data)
                             if ts:
                                 self.activities_events.append(
                                     {
@@ -1168,12 +1196,10 @@ class DiscordExportViewer(QMainWindow):
 
     def on_activities_toggle(self, checked: bool) -> None:
         """
-        When the Activities metadata checkbox is toggled, we simply
-        re-render the currently selected message details (if any) so that
-        it includes or excludes the activities section.
+        Enable/disable the use of Activities metadata and refresh the details
+        panel for the currently selected message.
         """
         self.activities_enabled = checked
-        # Force detail panel refresh for current message selection
         self.on_message_selected()
         if checked:
             self.show_status_message(
@@ -1184,19 +1210,12 @@ class DiscordExportViewer(QMainWindow):
 
     def get_related_activities_for_message(self, msg_timestamp: str) -> List[Dict[str, Any]]:
         """
-        Very naive matching: if an event's timestamp string shares the
-        same *date* (first 10 characters) as the message's Timestamp,
-        we treat it as "related".
-
-        For example:
-            message Timestamp: "2021-07-30 04:20:27"
-            event timestamp:   "2021-07-30T04:00:00Z"
-        -> both share "2021-07-30".
+        Find events whose timestamp date matches the message's date (YYYY-MM-DD).
         """
         if not msg_timestamp or not self.activities_events:
             return []
 
-        msg_date = str(msg_timestamp)[:10]  # "YYYY-MM-DD"
+        msg_date = str(msg_timestamp)[:10]
         if len(msg_date) < 4:
             return []
 
@@ -1206,7 +1225,6 @@ class DiscordExportViewer(QMainWindow):
             if ev_ts[:10] == msg_date:
                 related.append(ev)
 
-        # You might limit this to avoid spamming; for now, return all
         return related
 
     # ======================================================================
@@ -1214,13 +1232,13 @@ class DiscordExportViewer(QMainWindow):
     # ======================================================================
 
     def populate_channel_list(self) -> None:
-        """Populate channel list widget based on filters."""
+        """Populate channel list at left based on filter settings."""
         self.channel_list_widget.clear()
 
         attachments_only = self.channel_attachments_only_checkbox.isChecked()
 
         for entry in self.channel_entries:
-            # Filter by DM/server
+            # Filter by DM vs server
             if self.current_channel_filter != "all" and entry["kind"] != self.current_channel_filter:
                 continue
 
@@ -1238,567 +1256,11 @@ class DiscordExportViewer(QMainWindow):
             self.channel_list_widget.addItem(item)
 
     def on_channel_filter_changed(self, index: int) -> None:
-        """Handle change in 'Show: All / Private / Server' combo box."""
-        if index == 1:
-            self.current_channel_filter = "dm"
-        elif index == 2:
-            self.current_channel_filter = "server"
-        else:
-            self.current_channel_filter = "all"
-
-        self.populate_channel_list()
-        self.clear_messages()
-        self.details_text_edit.clear()
-        self.show_status_message(
-            f"Channel filter changed to: {self.current_channel_filter}"
-        )
-
-    def on_channel_attachments_filter_changed(self, checked: bool) -> None:
-        """Handle toggling 'Only channels with attachments'."""
-        self.populate_channel_list()
-        self.clear_messages()
-        self.details_text_edit.clear()
-        if checked:
-            self.show_status_message("Showing only channels with attachments.")
-        else:
-            self.show_status_message("Showing all channels (attachments or not).")
-
-    def sort_channels_az(self) -> None:
-        """Sort channel list items A→Z by their display text."""
-        self.channel_list_widget.sortItems(Qt.SortOrder.AscendingOrder)
-
-    def sort_channels_za(self) -> None:
-        """Sort channel list items Z→A by their display text."""
-        self.channel_list_widget.sortItems(Qt.SortOrder.DescendingOrder)
-
-    # ======================================================================
-    # Channel selection
-    # ======================================================================
-
-    def on_channel_selected(self) -> None:
-        """Load messages for the selected channel."""
-        items = self.channel_list_widget.selectedItems()
-        if not items:
-            return
-
-        item = items[0]
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(data, Tuple) or len(data) != 2:
-            return
-
-        channel_id, messages_path = data
-        self.load_channel_messages(channel_id, messages_path)
-
-    def load_channel_messages(self, channel_id: str, messages_path: str) -> None:
         """
-        Load Messages/<channel_id>/messages.json, store into
-        current_messages_unfiltered, then apply filters.
+        Map combo box index:
+            0 -> "all"
+            1 -> "dm"
+            2 -> "server"
+        Then repopulate channel list.
         """
-        self.clear_messages()
-        self.details_text_edit.clear()
-        # Keep search text & attachments-only filter; they will be reapplied.
-
-        try:
-            with open(messages_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Error Loading messages.json",
-                f"Could not load messages for channel {channel_id}:\n"
-                f"{messages_path}\n\nError: {exc}",
-            )
-            self.show_status_message("Failed to load messages.")
-            return
-
-        if not isinstance(data, list):
-            QMessageBox.warning(
-                self,
-                "Unexpected messages.json Format",
-                f"The file at:\n{messages_path}\n\nis not a JSON array.",
-            )
-        messages = [m for m in data if isinstance(m, dict)]
-        self.current_messages_unfiltered = messages
-        self.current_messages = list(messages)
-
-        self.apply_message_filters(from_search=False)
-
-        label = self.channel_index.get(channel_id, f"{channel_id} (unknown)")
-        self.show_status_message(
-            f"Loaded {len(messages)} messages from channel: {label} [{channel_id}]",
-            timeout_ms=8000,
-        )
-
-        hint = (
-            f"Channel: {label} [{channel_id}]\n"
-            f"Messages file: {messages_path}\n"
-            f"Total messages loaded: {len(messages)}\n\n"
-            "Use search, attachments-only, sort, and Activities toggle as needed.\n"
-            "Select a row to see full JSON. Double-click 'Yes' in 'Attachments?' "
-            "to view URLs."
-        )
-        self.details_text_edit.setPlainText(hint)
-
-    # ======================================================================
-    # Message table population & helpers
-    # ======================================================================
-
-    def clear_messages(self) -> None:
-        """Clear in-memory messages and table rows."""
-        self.current_messages_unfiltered = []
-        self.current_messages = []
-        self.messages_table.setRowCount(0)
-
-    def populate_messages_table(self) -> None:
-        """Populate the messages table from self.current_messages."""
-        messages = self.current_messages
-        self.messages_table.setRowCount(len(messages))
-
-        for row, msg in enumerate(messages):
-            msg_id = self._extract_message_id(msg)
-            timestamp = self._extract_message_timestamp(msg)
-            contents = self._extract_message_contents(msg)
-            attachments_flag = self._extract_attachments_flag(msg)
-
-            id_item = QTableWidgetItem(msg_id)
-            ts_item = QTableWidgetItem(timestamp)
-            contents_item = QTableWidgetItem(contents)
-            att_item = QTableWidgetItem(attachments_flag)
-
-            # Store the full message dict in the ID item so sorting keeps mapping
-            id_item.setData(Qt.ItemDataRole.UserRole, msg)
-
-            for item in (id_item, ts_item, contents_item, att_item):
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-
-            self.messages_table.setItem(row, 0, id_item)
-            self.messages_table.setItem(row, 1, ts_item)
-            self.messages_table.setItem(row, 2, contents_item)
-            self.messages_table.setItem(row, 3, att_item)
-
-        self.messages_table.resizeColumnsToContents()
-
-    # ---- Message field extractors ----
-
-    @staticmethod
-    def _extract_message_id(msg: JsonObject) -> str:
-        val = msg.get("ID")
-        return str(val) if val is not None else ""
-
-    @staticmethod
-    def _extract_message_timestamp(msg: JsonObject) -> str:
-        ts = msg.get("Timestamp")
-        return str(ts) if ts is not None else ""
-
-    @staticmethod
-    def _extract_message_contents(msg: JsonObject) -> str:
-        contents = msg.get("Contents", "")
-        return str(contents) if contents is not None else ""
-
-    @staticmethod
-    def _extract_attachments_flag(msg: JsonObject) -> str:
-        attachments = msg.get("Attachments", "")
-        attachments_str = str(attachments).strip() if attachments is not None else ""
-        return "Yes" if attachments_str else "No"
-
-    @staticmethod
-    def _extract_attachments_list(msg: JsonObject) -> List[str]:
-        """
-        Convert "Attachments" string into a list of URLs by splitting
-        on whitespace and commas. This is heuristic but works with
-        typical Discord exports.
-        """
-        attachments = msg.get("Attachments", "")
-        if attachments is None:
-            return []
-
-        s = str(attachments).strip()
-        if not s:
-            return []
-
-        raw_parts: List[str] = []
-        # Replace commas with spaces to treat both as separators
-        for part in s.replace(",", " ").split():
-            part = part.strip()
-            if part:
-                raw_parts.append(part)
-
-        return raw_parts
-
-    # ======================================================================
-    # Message selection & attachments double-click
-    # ======================================================================
-
-    def on_message_selected(self) -> None:
-        """
-        Update the details panel to show full JSON for the currently
-        selected message, plus optional activities metadata.
-        """
-        selected_items = self.messages_table.selectedItems()
-        if not selected_items:
-            return
-
-        row = selected_items[0].row()
-        id_item = self.messages_table.item(row, 0)
-        if id_item is None:
-            return
-
-        msg = id_item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(msg, dict):
-            # Fallback if for some reason userData is missing
-            if 0 <= row < len(self.current_messages):
-                msg = self.current_messages[row]
-            else:
-                return
-
-        # Pretty-print the message JSON
-        try:
-            pretty = json.dumps(msg, indent=4, ensure_ascii=False)
-        except Exception as exc:
-            pretty = f"Error pretty-printing JSON: {exc}\n\nRaw: {repr(msg)}"
-
-        # If Activities metadata is enabled, append related events
-        if self.activities_enabled and self.activities_events:
-            ts = self._extract_message_timestamp(msg)
-            related = self.get_related_activities_for_message(ts)
-            if related:
-                pretty += "\n\n--- Activities metadata (experimental) ---\n"
-                for i, ev in enumerate(related, start=1):
-                    try:
-                        ev_json = json.dumps(ev["raw"], indent=2, ensure_ascii=False)
-                    except Exception:
-                        ev_json = repr(ev["raw"])
-                    pretty += f"\n[Event {i}] source: {ev['source_file']}\n{ev_json}\n"
-            else:
-                pretty += (
-                    "\n\n--- Activities metadata (experimental) ---\n"
-                    "No activity events found with the same date as this message.\n"
-                )
-
-        self.details_text_edit.setPlainText(pretty)
-
-    def on_message_cell_double_clicked(self, row: int, column: int) -> None:
-        """
-        If user double-clicks the "Attachments?" column and it's "Yes",
-        open the AttachmentViewerDialog with the list of URLs.
-        """
-        if column != 3:
-            return
-
-        id_item = self.messages_table.item(row, 0)
-        att_item = self.messages_table.item(row, 3)
-        if id_item is None or att_item is None:
-            return
-
-        if att_item.text() != "Yes":
-            return
-
-        msg = id_item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(msg, dict):
-            return
-
-        urls = self._extract_attachments_list(msg)
-        if not urls:
-            QMessageBox.information(
-                self,
-                "Attachments",
-                "No attachment URLs found (Attachments field may be malformed).",
-            )
-            return
-
-        dlg = AttachmentViewerDialog(self, urls)
-        dlg.exec()
-
-    # ======================================================================
-    # Message filters (search + attachments-only) & sorting
-    # ======================================================================
-
-    def apply_message_filters(self, from_search: bool = False) -> None:
-        """
-        Apply message-level filters to current_messages_unfiltered and
-        repopulate the table:
-
-        - Search: substring in "Contents" (case-insensitive)
-        - Attachments-only: only messages where Attachments? == "Yes"
-        """
-        if not self.current_messages_unfiltered:
-            self.messages_table.setRowCount(0)
-            return
-
-        query = self.search_line_edit.text().strip()
-        query_lower = query.lower()
-        attachments_only = self.message_attachments_only_checkbox.isChecked()
-
-        filtered: List[JsonObject] = []
-
-        for msg in self.current_messages_unfiltered:
-            # Attachments filter
-            if attachments_only and self._extract_attachments_flag(msg) != "Yes":
-                continue
-
-            # Search filter
-            if query_lower:
-                contents = self._extract_message_contents(msg).lower()
-                if query_lower not in contents:
-                    continue
-
-            filtered.append(msg)
-
-        self.current_messages = filtered
-        self.populate_messages_table()
-
-        # Status message
-        if query_lower:
-            self.show_status_message(
-                f"Filters: search='{query}', attachments_only={attachments_only} "
-                f"-> {len(filtered)} messages.",
-                timeout_ms=8000,
-            )
-        else:
-            if attachments_only:
-                self.show_status_message(
-                    f"Filter: attachments_only={attachments_only} "
-                    f"-> {len(filtered)} messages.",
-                    timeout_ms=8000,
-                )
-            else:
-                if from_search:
-                    self.show_status_message(
-                        "Search cleared; showing all messages.", timeout_ms=5000
-                    )
-                else:
-                    self.show_status_message(
-                        f"Showing all {len(filtered)} messages (no filters).",
-                        timeout_ms=5000,
-                    )
-
-    def on_search_clicked(self) -> None:
-        """Apply message filters when Search is pressed."""
-        self.apply_message_filters(from_search=True)
-
-    def on_clear_search_clicked(self) -> None:
-        """Clear search box and reapply filters (attachments-only may stay)."""
-        self.search_line_edit.clear()
-        self.apply_message_filters(from_search=True)
-
-    def on_message_attachments_filter_changed(self, checked: bool) -> None:
-        """Toggle the 'Only messages with attachments' filter."""
-        self.apply_message_filters(from_search=False)
-        if checked:
-            self.show_status_message("Showing only messages with attachments.")
-        else:
-            self.show_status_message("Showing messages with or without attachments.")
-
-    def sort_messages_time_asc(self) -> None:
-        """Sort messages table by Timestamp ascending."""
-        self.messages_table.sortItems(1, Qt.SortOrder.AscendingOrder)
-
-    def sort_messages_time_desc(self) -> None:
-        """Sort messages table by Timestamp descending."""
-        self.messages_table.sortItems(1, Qt.SortOrder.DescendingOrder)
-
-    # ======================================================================
-    # Global search (all channels)
-    # ======================================================================
-
-    def on_global_search_clicked(self) -> None:
-        """
-        Search ALL channels for text in the search box, matching against
-        "Contents" (case-insensitive), and show results in a dialog.
-        """
-        query = self.search_line_edit.text().strip()
-        if not query:
-            QMessageBox.information(
-                self,
-                "Global Search",
-                "Please type something in the search box first.",
-            )
-            return
-
-        query_lower = query.lower()
-        results: List[Dict[str, Any]] = []
-
-        for entry in self.channel_entries:
-            channel_id = entry["id"]
-            label = entry["label"]
-            path = entry["path"]
-
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception:
-                continue
-
-            if not isinstance(data, list):
-                continue
-
-            for msg in data:
-                if not isinstance(msg, dict):
-                    continue
-                contents = self._extract_message_contents(msg).lower()
-                if query_lower in contents:
-                    has_att = self._extract_attachments_flag(msg) == "Yes"
-                    res = dict(msg)  # copy
-                    res["channel_id"] = channel_id
-                    res["channel_label"] = label
-                    res["has_attachments"] = has_att
-                    results.append(res)
-
-        dlg = GlobalSearchDialog(self, results, parent=self)
-        dlg.exec()
-
-    def jump_to_message(self, channel_id: str, message_id: str) -> None:
-        """
-        Called by GlobalSearchDialog when user double-clicks a result row.
-
-        Steps:
-        1. Find the corresponding channel in the left list and select it.
-        2. Let on_channel_selected load its messages.
-        3. Find the message with the given ID in the messages table and select it.
-        """
-        # 1) Find channel item
-        target_item: Optional[QListWidgetItem] = None
-        for i in range(self.channel_list_widget.count()):
-            item = self.channel_list_widget.item(i)
-            data = item.data(Qt.ItemDataRole.UserRole)
-            if not isinstance(data, tuple) or len(data) != 2:
-                continue
-            cid, _ = data
-            if str(cid) == str(channel_id):
-                target_item = item
-                break
-
-        if not target_item:
-            QMessageBox.warning(
-                self,
-                "Jump to Message",
-                f"Could not find channel {channel_id} in the current filter view.\n"
-                "Try adjusting the channel filters (DM/Server/attachments).",
-            )
-            return
-
-        # Selecting the item will load its messages via on_channel_selected
-        self.channel_list_widget.setCurrentItem(target_item)
-
-        # 2) After load, locate the message row
-        for row in range(self.messages_table.rowCount()):
-            id_item = self.messages_table.item(row, 0)
-            if id_item is None:
-                continue
-            if id_item.text() == str(message_id):
-                self.messages_table.setCurrentItem(id_item)
-                self.messages_table.scrollToItem(id_item)
-                break
-
-    # ======================================================================
-    # Export current (filtered) messages
-    # ======================================================================
-
-    def export_current_to_csv(self) -> None:
-        """
-        Export the currently visible (filtered) messages in the table
-        to a CSV file.
-        """
-        if not self.current_messages:
-            QMessageBox.information(
-                self,
-                "Export CSV",
-                "There are no messages to export (table is empty).",
-            )
-            return
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Current Messages as CSV",
-            "",
-            "CSV Files (*.csv);;All Files (*)",
-        )
-        if not path:
-            return
-
-        try:
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                writer = csv.writer(f)
-                # Header
-                writer.writerow(["ID", "Timestamp", "Contents", "Attachments"])
-                # Rows from current_messages
-                for msg in self.current_messages:
-                    msg_id = self._extract_message_id(msg)
-                    ts = self._extract_message_timestamp(msg)
-                    contents = self._extract_message_contents(msg)
-                    attachments = str(msg.get("Attachments", ""))
-                    writer.writerow([msg_id, ts, contents, attachments])
-            QMessageBox.information(
-                self,
-                "Export CSV",
-                f"Current messages successfully exported to:\n{path}",
-            )
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Export CSV",
-                f"Failed to export CSV:\n{path}\n\nError: {exc}",
-            )
-
-    def export_current_to_markdown(self) -> None:
-        """
-        Export the currently visible (filtered) messages in the table
-        to a Markdown file as a simple table.
-        """
-        if not self.current_messages:
-            QMessageBox.information(
-                self,
-                "Export Markdown",
-                "There are no messages to export (table is empty).",
-            )
-            return
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Current Messages as Markdown",
-            "",
-            "Markdown Files (*.md);;All Files (*)",
-        )
-        if not path:
-            return
-
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write("# Exported Messages (Current Filter)\n\n")
-                f.write("| ID | Timestamp | Attachments? | Contents |\n")
-                f.write("|----|-----------|--------------|----------|\n")
-                for msg in self.current_messages:
-                    msg_id = self._extract_message_id(msg)
-                    ts = self._extract_message_timestamp(msg)
-                    contents = self._extract_message_contents(msg)
-                    contents = contents.replace("\n", " ").replace("|", "\\|")
-                    attachments_flag = self._extract_attachments_flag(msg)
-                    f.write(
-                        f"| {msg_id} | {ts} | {attachments_flag} | {contents} |\n"
-                    )
-            QMessageBox.information(
-                self,
-                "Export Markdown",
-                f"Current messages successfully exported to:\n{path}",
-            )
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Export Markdown",
-                f"Failed to export Markdown:\n{path}\n\nError: {exc}",
-            )
-
-
-# ======================================================================
-# Entry point
-# ======================================================================
-
-def main() -> None:
-    app = QApplication(sys.argv)
-    window = DiscordExportViewer()
-    window.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
+        if
