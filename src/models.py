@@ -9,7 +9,7 @@ This module is intentionally GUI-agnostic:
 - It knows how to:
     * Locate and parse the `Messages/index.json` file inside the export.
     * Discover channel folders under `Messages/` and their `messages.json` files.
-    * Classify channels as "dm" or "server" using a simple heuristic.
+    * Read `channel.json` in each channel folder to determine type (DM vs server).
     * Load messages for a specific channel on demand.
     * Extract important fields from each message:
         - ID
@@ -21,11 +21,6 @@ This module is intentionally GUI-agnostic:
       and associate events by date with message timestamps.
 
 - It does NOT depend on PyQt or any GUI concepts.
-
-`main_window.py` is responsible for:
-    * Presenting data in widgets
-    * Handling user interactions
-    * Calling methods in this model
 """
 
 from __future__ import annotations
@@ -68,7 +63,8 @@ class ChannelEntry:
         Logical channel type:
             - "dm"     : direct/private message
             - "server" : server channel (guild text channel)
-        The classification is heuristic and derived from the label.
+        The classification is primarily driven by channel.json["type"], with a
+        fallback heuristic based on the label.
 
     has_attachments : bool
         Whether any message in this channel appears to contain a non-empty
@@ -129,6 +125,7 @@ class DiscordExportModel:
     ----------------
     - Resolving the export root directory.
     - Discovering channels under `Messages/`.
+    - Reading `channel.json` to determine DM vs server.
     - Exposing channel metadata to the GUI.
     - Loading and parsing `messages.json` files.
     - Offering helpers for extracting message fields.
@@ -165,6 +162,8 @@ class DiscordExportModel:
         - Scans the `Messages/` directory to find channels and messages files.
         - Parses `Messages/index.json` (if present) to assign human-readable
           names to channels.
+        - Reads each `Messages/<channel_id>/channel.json` to determine whether
+          the channel is a DM or server channel.
         - Best-effort loads activity metadata from `Activity/` (if present).
 
         Parameters
@@ -212,7 +211,8 @@ class DiscordExportModel:
             if not dir_entry.is_dir():
                 continue
 
-            messages_json_path = os.path.join(dir_entry.path, "messages.json")
+            channel_folder = dir_entry.path
+            messages_json_path = os.path.join(channel_folder, "messages.json")
             if not os.path.isfile(messages_json_path):
                 # Not a channel folder or missing messages.json
                 continue
@@ -221,8 +221,23 @@ class DiscordExportModel:
             # Human-readable label from index.json (if present)
             label = self.index_labels.get(channel_id, f"{channel_id} (unknown)")
 
-            # Classify as DM or server
-            kind = self._classify_kind(label)
+            # Try to read channel.json for an explicit "type"
+            channel_json_type: Optional[str] = None
+            channel_json_path = os.path.join(channel_folder, "channel.json")
+            if os.path.isfile(channel_json_path):
+                try:
+                    with open(channel_json_path, "r", encoding="utf-8") as f:
+                        ch_data = json.load(f)
+                    if isinstance(ch_data, dict):
+                        t_val = ch_data.get("type")
+                        if t_val is not None:
+                            channel_json_type = str(t_val)
+                except Exception:
+                    # If channel.json is weird, we just ignore it.
+                    channel_json_type = None
+
+            # Classify as DM or server, using type first, then label heuristic
+            kind = self._classify_kind(label, channel_json_type)
 
             # Detect whether any messages in this file have attachments
             has_attachments = self._detect_attachments(messages_json_path)
@@ -258,26 +273,30 @@ class DiscordExportModel:
         )
 
     @staticmethod
-    def _classify_kind(label: str) -> str:
+    def _classify_kind(label: str, channel_type: Optional[str] = None) -> str:
         """
-        Heuristically classify a channel as "dm" or "server" based on its label.
+        Classify a channel as "dm" or "server".
 
-        This uses simple string checks that are easy to tweak if your export
-        uses different naming conventions.
+        Priority:
+        1. If channel_type (from channel.json["type"]) is present, use that.
+        2. Otherwise, fall back to heuristics based on the label.
 
-        Parameters
-        ----------
-        label : str
-            Human-readable channel label from `Messages/index.json`.
-
-        Returns
-        -------
-        str
-            Either "dm" or "server".
+        Discord export samples show things like:
+            {"id": "...", "type": "DM", "recipients": [...]}
+        so we treat "DM" (case-insensitive) as direct messages.
         """
+        # 1) Try explicit channel type from channel.json
+        if channel_type is not None:
+            t = str(channel_type).strip().lower()
+            # Common DM markers
+            if t in {"dm", "direct_message", "group_dm", "private"}:
+                return "dm"
+            # Anything guild/text/thread-ish we treat as a server channel
+            if "guild" in t or "text" in t or "thread" in t or "server" in t:
+                return "server"
+
+        # 2) Fallback: label heuristics (for older exports / weird cases)
         lowered = label.lower()
-
-        # Simple heuristics for direct messages / private messages
         if lowered.startswith("direct message"):
             return "dm"
         if "dm with" in lowered:
