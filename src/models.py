@@ -4,19 +4,28 @@ models.py
 
 Backend data model layer for the Discord JSON export viewer.
 
-This file is intentionally "dumb but predictable":
+This module is intentionally GUI-agnostic:
 
 - It knows how to:
-    * Locate and parse the `Messages/index.json` file.
-    * Discover channel folders and their `messages.json` files.
-    * Distinguish between "dm" and "server" channels (best-effort heuristic).
-    * Load messages for a given channel.
-    * Extract useful fields from each message (ID, Timestamp, Contents, Attachments).
-    * Perform a global search across ALL channels (for dialogs.GlobalSearchDialog).
-    * Optionally load "Activities" metadata and associate it by date.
+    * Locate and parse the `Messages/index.json` file inside the export.
+    * Discover channel folders under `Messages/` and their `messages.json` files.
+    * Classify channels as "dm" or "server" using a simple heuristic.
+    * Load messages for a specific channel on demand.
+    * Extract important fields from each message:
+        - ID
+        - Timestamp
+        - Contents
+        - Attachments (flag + parsed list)
+    * Perform a global search across ALL channels.
+    * Optionally load "Activities" metadata (if an `Activity/` folder exists)
+      and associate events by date with message timestamps.
 
-- It does NOT know anything about Qt widgets. That separation keeps things
-  testable and lets the GUI stay focused on presentation.
+- It does NOT depend on PyQt or any GUI concepts.
+
+`main_window.py` is responsible for:
+    * Presenting data in widgets
+    * Handling user interactions
+    * Calling methods in this model
 """
 
 from __future__ import annotations
@@ -24,38 +33,47 @@ from __future__ import annotations
 import os
 import json
 import datetime
-from typing import List, Dict, Optional, Any, Iterable
+from typing import List, Dict, Optional, Any
 
 
-# Type alias for JSON objects used throughout
+# ---------------------------------------------------------------------------
+# Type aliases for clarity
+# ---------------------------------------------------------------------------
+
 JsonObject = Dict[str, Any]
 
 
+# ---------------------------------------------------------------------------
+# ChannelEntry: describes a single channel worth of messages
+# ---------------------------------------------------------------------------
+
 class ChannelEntry:
     """
-    Simple container for information about a single message channel.
+    Represents a single channel (DM or server text channel) in the export.
 
     Attributes
     ----------
     id : str
-        Channel ID (folder name under Messages/).
+        Channel ID. This usually corresponds to the folder name under
+        `Messages/` and also a key inside `Messages/index.json`.
 
     label : str
-        Human-readable label, usually coming from Messages/index.json.
-        If no label is known, we fall back to "<id> (unknown)".
+        Human-readable channel name. If `Messages/index.json` doesn't contain
+        an entry, we fall back to "<id> (unknown)".
 
     path : str
-        Full path to the channel's messages.json file.
+        Absolute path to this channel's `messages.json` file.
 
     kind : str
-        Logical type of channel:
-            - "dm"     : Direct message / private message
-            - "server" : Server channel (guild text channel)
-            - anything else is currently treated as "server" by the GUI.
+        Logical channel type:
+            - "dm"     : direct/private message
+            - "server" : server channel (guild text channel)
+        The classification is heuristic and derived from the label.
 
     has_attachments : bool
-        Whether at least one message in this channel appears to have an
-        "Attachments" field with non-empty text.
+        Whether any message in this channel appears to contain a non-empty
+        "Attachments" field. This supports the "channels with attachments only"
+        filter in the GUI.
     """
 
     def __init__(
@@ -73,20 +91,24 @@ class ChannelEntry:
         self.has_attachments = has_attachments
 
 
+# ---------------------------------------------------------------------------
+# ActivityEvent: metadata about user activities (experimental)
+# ---------------------------------------------------------------------------
+
 class ActivityEvent:
     """
-    Represents one "activity" event parsed from the Activity/ directory.
+    Represents a single "activity" record parsed from the `Activity/` folder.
 
     Attributes
     ----------
     date : datetime.date
-        The date that this activity is associated with.
+        Date of the event, parsed from a "YYYY-MM-DD" string in the JSON.
 
     raw : JsonObject
-        The raw JSON dictionary for this event.
+        The entire raw JSON object for this event (for detailed display).
 
     source_file : str
-        The basename of the file from which this event was loaded.
+        Basename of the JSON file from which this event was loaded.
     """
 
     def __init__(self, date: datetime.date, raw: JsonObject, source_file: str) -> None:
@@ -95,48 +117,71 @@ class ActivityEvent:
         self.source_file = source_file
 
 
+# ---------------------------------------------------------------------------
+# DiscordExportModel: the main data model for the viewer
+# ---------------------------------------------------------------------------
+
 class DiscordExportModel:
     """
     Core backend model for the Discord JSON export viewer.
 
-    This class is the "data brain" behind the Qt GUI:
-    - It is completely independent of PyQt.
-    - main_window.py asks it for channels and messages.
-    - dialogs.py consumes the output of global_search() results.
+    Responsibilities
+    ----------------
+    - Resolving the export root directory.
+    - Discovering channels under `Messages/`.
+    - Exposing channel metadata to the GUI.
+    - Loading and parsing `messages.json` files.
+    - Offering helpers for extracting message fields.
+    - Providing a global search across all messages.
+    - Optionally loading activity metadata from `Activity/` and providing
+      per-date lookups for messages.
     """
 
     def __init__(self) -> None:
-        # Root path to the export folder chosen by the user
+        # Root path to the Discord export folder selected by the user.
         self.root_folder: Optional[str] = None
 
-        # Map channel_id -> ChannelEntry
+        # All discovered channels:
+        #   channel_id (str) -> ChannelEntry
         self.channels: Dict[str, ChannelEntry] = {}
 
-        # Human-readable labels from Messages/index.json (channel_id -> label)
+        # Labels loaded from Messages/index.json:
+        #   channel_id (str) -> label (str)
         self.index_labels: Dict[str, str] = {}
 
-        # List of ActivityEvent objects loaded from Activity/ subfolder(s)
+        # Activity metadata loaded from Activity/:
         self.activities_events: List[ActivityEvent] = []
 
-    # ==================================================================
-    # Export scanning
-    # ==================================================================
+    # =====================================================================
+    # Export scanning / initialization
+    # =====================================================================
 
     def set_root_folder(self, folder: str) -> None:
         """
-        Configure the model to use a new root export folder.
+        Configure the model to use a new Discord export root folder.
 
-        This will:
-        - Reset all previously loaded state.
-        - Discover channels under Messages/.
-        - Attempt to load Activity metadata (if present).
+        This method:
+        - Resets any previous state.
+        - Scans the `Messages/` directory to find channels and messages files.
+        - Parses `Messages/index.json` (if present) to assign human-readable
+          names to channels.
+        - Best-effort loads activity metadata from `Activity/` (if present).
+
+        Parameters
+        ----------
+        folder : str
+            Absolute or relative path to the *root* of the export folder
+            (the one containing `Messages/`, `Account/`, etc.).
         """
+        # Reset state
         self.root_folder = folder
         self.channels.clear()
         self.index_labels.clear()
         self.activities_events.clear()
 
-        # Messages directory (must exist or we bail early)
+        # ------------------------------------------------------------------
+        # 1) Validate and locate Messages directory
+        # ------------------------------------------------------------------
         messages_dir = os.path.join(folder, "Messages")
         if not os.path.isdir(messages_dir):
             raise FileNotFoundError(
@@ -144,7 +189,7 @@ class DiscordExportModel:
             )
 
         # ------------------------------------------------------------------
-        # 1) Load Messages/index.json to get channel labels, if present.
+        # 2) Load Messages/index.json for channel labels (if present)
         # ------------------------------------------------------------------
         index_path = os.path.join(messages_dir, "index.json")
         if os.path.isfile(index_path):
@@ -152,32 +197,34 @@ class DiscordExportModel:
                 with open(index_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
-                    # Keys are channel IDs, values are labels
+                    # Keys are channel IDs, values are human-readable labels
                     self.index_labels = {
                         str(k): str(v) for k, v in data.items()
                     }
             except Exception:
-                # We don't die if index.json is malformed; we just fall back
-                # to unknown labels for channels.
+                # If index.json is malformed, we just won't have nice labels.
                 self.index_labels = {}
 
         # ------------------------------------------------------------------
-        # 2) Discover channel folders and build ChannelEntry objects
+        # 3) Discover channel folders & build ChannelEntry instances
         # ------------------------------------------------------------------
-        for entry in os.scandir(messages_dir):
-            if not entry.is_dir():
+        for dir_entry in os.scandir(messages_dir):
+            if not dir_entry.is_dir():
                 continue
 
-            messages_json_path = os.path.join(entry.path, "messages.json")
+            messages_json_path = os.path.join(dir_entry.path, "messages.json")
             if not os.path.isfile(messages_json_path):
-                # Some folders may not actually be channel message folders.
+                # Not a channel folder or missing messages.json
                 continue
 
-            channel_id = entry.name
+            channel_id = dir_entry.name
+            # Human-readable label from index.json (if present)
             label = self.index_labels.get(channel_id, f"{channel_id} (unknown)")
 
+            # Classify as DM or server
             kind = self._classify_kind(label)
 
+            # Detect whether any messages in this file have attachments
             has_attachments = self._detect_attachments(messages_json_path)
 
             self.channels[channel_id] = ChannelEntry(
@@ -189,20 +236,21 @@ class DiscordExportModel:
             )
 
         # ------------------------------------------------------------------
-        # 3) Load Activities metadata (optional; best-effort)
+        # 4) Load Activities metadata from Activity/ (optional)
         # ------------------------------------------------------------------
         self._load_activities(folder)
 
-    # ==================================================================
+    # =====================================================================
     # Channel helpers
-    # ==================================================================
+    # =====================================================================
 
     def get_channel_entries(self) -> List[ChannelEntry]:
         """
-        Return all ChannelEntry objects sorted by label (case-insensitive).
+        Return all ChannelEntry objects, sorted by label (case-insensitive).
 
-        main_window.py calls this to populate the channel list, and then
-        applies filter logic (All / DM / Server / attachments-only) on top.
+        This is exactly what `main_window.py` expects to call when populating
+        the channel list in the left-hand pane, before it applies any
+        additional filters (DM vs Server, attachments-only, etc.).
         """
         return sorted(
             self.channels.values(),
@@ -212,17 +260,27 @@ class DiscordExportModel:
     @staticmethod
     def _classify_kind(label: str) -> str:
         """
-        Try to infer whether a channel is:
-            - a direct message ("dm")
-            - a server channel ("server")
+        Heuristically classify a channel as "dm" or "server" based on its label.
 
-        We only have the label from index.json, so this is heuristic and
-        may be imperfect depending on the export / tooling that generated it.
+        This uses simple string checks that are easy to tweak if your export
+        uses different naming conventions.
+
+        Parameters
+        ----------
+        label : str
+            Human-readable channel label from `Messages/index.json`.
+
+        Returns
+        -------
+        str
+            Either "dm" or "server".
         """
         lowered = label.lower()
 
-        # Very simple heuristics; tweak as needed for your export format.
-        if lowered.startswith("direct message") or "dm with" in lowered:
+        # Simple heuristics for direct messages / private messages
+        if lowered.startswith("direct message"):
+            return "dm"
+        if "dm with" in lowered:
             return "dm"
         if "private" in lowered:
             return "dm"
@@ -233,10 +291,20 @@ class DiscordExportModel:
     @staticmethod
     def _detect_attachments(messages_path: str) -> bool:
         """
-        Quick scan of messages.json to see if ANY message in that file has a
-        non-empty "Attachments" field.
+        Quick scan of a messages.json file to determine if any message appears
+        to contain attachments.
 
-        This lets the GUI add a "channels with attachments only" filter.
+        We simply check if any message has a non-empty "Attachments" string.
+
+        Parameters
+        ----------
+        messages_path : str
+            Full path to a `messages.json` file.
+
+        Returns
+        -------
+        bool
+            True if at least one message seems to have attachments, else False.
         """
         try:
             with open(messages_path, "r", encoding="utf-8") as f:
@@ -256,16 +324,24 @@ class DiscordExportModel:
 
         return False
 
-    # ==================================================================
-    # Messages loading & field utilities
-    # ==================================================================
+    # =====================================================================
+    # Messages loading and field extraction
+    # =====================================================================
 
     def load_channel_messages(self, channel_id: str) -> List[JsonObject]:
         """
-        Load and return the list of message dictionaries for a given channel.
+        Load and return the list of messages for a given channel.
 
-        If the messages.json file is malformed or not a list, we return an
-        empty list rather than raising.
+        Parameters
+        ----------
+        channel_id : str
+            ID of the channel to load messages from.
+
+        Returns
+        -------
+        List[JsonObject]
+            A list of dictionaries (one per message). If the file cannot be
+            parsed or is not a list, an empty list is returned.
         """
         if channel_id not in self.channels:
             return []
@@ -281,15 +357,17 @@ class DiscordExportModel:
         if not isinstance(data, list):
             return []
 
-        # Filter out any non-dict entries to be safe
-        return [m for m in data if isinstance(m, dict)]
+        # Filter to dict entries only, just to be safe
+        return [msg for msg in data if isinstance(msg, dict)]
 
-    # ---------- field extraction helpers ----------
+    # ----- Helper methods for accessing fields in a message dict -----
 
     @staticmethod
     def extract_message_id(msg: JsonObject) -> str:
         """
-        Extract the message ID as a string (or empty string if missing).
+        Extract message ID as a string.
+
+        If the ID is missing, return an empty string.
         """
         val = msg.get("ID")
         return str(val) if val is not None else ""
@@ -297,11 +375,11 @@ class DiscordExportModel:
     @staticmethod
     def extract_message_timestamp(msg: JsonObject) -> str:
         """
-        Extract the timestamp string from a message.
+        Extract timestamp string from a message.
 
-        The exact format comes from the export, but in many dumps it looks like:
+        The format depends on the exporter, but usually looks like:
             "YYYY-MM-DD HH:MM:SS"
-        We do NOT attempt to fully parse it here (except where we need date-only).
+        We leave it as-is and let the GUI decide how to display it.
         """
         ts = msg.get("Timestamp")
         return str(ts) if ts is not None else ""
@@ -309,7 +387,9 @@ class DiscordExportModel:
     @staticmethod
     def extract_message_contents(msg: JsonObject) -> str:
         """
-        Extract the human-readable text contents of a message.
+        Extract human-readable text content from the message.
+
+        If missing, we return an empty string.
         """
         contents = msg.get("Contents", "")
         return str(contents) if contents is not None else ""
@@ -317,7 +397,10 @@ class DiscordExportModel:
     @staticmethod
     def extract_attachments_flag(msg: JsonObject) -> str:
         """
-        Return "Yes" / "No" for whether a message has any attachment text.
+        Return "Yes" or "No" depending on whether a message appears to have
+        any attachments.
+
+        This is used to populate the "Attachments?" column in the GUI.
         """
         att = msg.get("Attachments", "")
         if isinstance(att, str) and att.strip():
@@ -327,12 +410,15 @@ class DiscordExportModel:
     @staticmethod
     def extract_attachments_list(msg: JsonObject) -> List[str]:
         """
-        Convert the "Attachments" field into a list of URLs / file paths.
+        Extract the list of attachment URLs / file paths from a message.
 
-        Many exports store attachments as a single comma-separated string.
-        We split on commas and strip whitespace to get a cleaner list.
+        Many Discord export tools store attachments as a single comma-separated
+        string. Here we convert that into a list of trimmed entries.
 
-        If the field is missing or not a string, we return an empty list.
+        Returns
+        -------
+        List[str]
+            List of attachment URLs/paths, or an empty list if none.
         """
         att = msg.get("Attachments", "")
         if not isinstance(att, str):
@@ -340,25 +426,24 @@ class DiscordExportModel:
         parts = [a.strip() for a in att.split(",") if a.strip()]
         return parts
 
-    # ==================================================================
-    # Global search across ALL channels
-    # ==================================================================
+    # =====================================================================
+    # Global search across all channels
+    # =====================================================================
 
     def global_search(self, query: str) -> List[Dict[str, Any]]:
         """
-        Perform a simple case-insensitive search of `Contents` across every
-        messages.json file / channel.
+        Perform a case-insensitive search of the message contents across ALL
+        channels and return a flattened list of hits.
 
         Parameters
         ----------
         query : str
-            Text to look for inside message contents (case-insensitive).
+            Text to search for inside `Contents` of each message.
 
         Returns
         -------
         List[Dict[str, Any]]
-            Each dict is a "flattened" result consumed by dialogs.GlobalSearchDialog:
-
+            Each result is a dict with keys expected by dialogs.GlobalSearchDialog:
                 {
                     "channel_id":      <str>,
                     "channel_label":   <str>,
@@ -369,15 +454,10 @@ class DiscordExportModel:
                     "attachment_flag": "Yes" or "No",
                     "has_attachments": bool,
                 }
-
-            Note that:
-            - "attachment_flag" is a string "Yes"/"No" for the UI.
-            - "has_attachments" is a boolean convenience field.
         """
         query_lower = query.lower()
         results: List[Dict[str, Any]] = []
 
-        # Iterate over all known channels
         for cid, ch_entry in self.channels.items():
             messages = self.load_channel_messages(cid)
             if not messages:
@@ -391,7 +471,7 @@ class DiscordExportModel:
                 msg_id = self.extract_message_id(msg)
                 ts = self.extract_message_timestamp(msg)
                 att_flag = self.extract_attachments_flag(msg)
-                has_att = att_flag == "Yes"
+                has_att = (att_flag == "Yes")
 
                 results.append(
                     {
@@ -408,22 +488,28 @@ class DiscordExportModel:
 
         return results
 
-    # ==================================================================
+    # =====================================================================
     # Activities metadata (experimental)
-    # ==================================================================
+    # =====================================================================
 
     def _load_activities(self, root: str) -> None:
         """
-        Best-effort loader for "Activities" metadata under the "Activity"
-        folder inside the export.
+        Load activity metadata from the `Activity/` directory, if it exists.
 
-        The exact structure of your export's Activity folder may vary. This
-        implementation expects any JSON files directly under Activity/ to be
-        lists of dicts containing at least a "date" field in "YYYY-MM-DD" form.
+        This is experimental and heavily depends on how your export tool
+        structures the Activity data. Here we assume:
+
+        - There's a folder named `Activity/` at the root.
+        - It may contain one or more `.json` files.
+        - Each file is a JSON array of objects.
+        - Each object has a "date" field formatted as "YYYY-MM-DD".
+
+        For each event, we store an ActivityEvent so that the GUI can show
+        any events whose date matches a message's date.
         """
         activity_root = os.path.join(root, "Activity")
         if not os.path.isdir(activity_root):
-            # Nothing to do; activities metadata is optional.
+            # No Activity directory -> no metadata; that's fine.
             return
 
         for entry in os.scandir(activity_root):
@@ -435,8 +521,8 @@ class DiscordExportModel:
 
     def _load_activity_file(self, path: str) -> None:
         """
-        Load a single Activity JSON file and append ActivityEvent objects
-        to self.activities_events.
+        Load a single activity JSON file from the Activity/ directory and
+        append parsed events to `self.activities_events`.
         """
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -458,36 +544,36 @@ class DiscordExportModel:
             try:
                 dt = datetime.datetime.strptime(raw_date, "%Y-%m-%d").date()
             except Exception:
-                # If it's not parseable, we skip it.
+                # If we can't parse the date, skip this event.
                 continue
 
             self.activities_events.append(
-                ActivityEvent(date=dt, raw=ev, source_file=os.path.basename(path))
+                ActivityEvent(
+                    date=dt,
+                    raw=ev,
+                    source_file=os.path.basename(path),
+                )
             )
-
-    # ------------------------------------------------------------------
 
     def get_related_activities_for_timestamp(self, timestamp_str: str) -> List[ActivityEvent]:
         """
-        Given a message timestamp string (usually "YYYY-MM-DD HH:MM:SS"),
-        return a list of ActivityEvent objects whose date matches the same day.
+        Given a message timestamp string (typically "YYYY-MM-DD HH:MM:SS"),
+        return all ActivityEvent objects whose date matches the same calendar
+        day.
 
-        This is used by the GUI to append "Activities metadata" to the JSON
-        view of each message when the toggle is enabled.
+        This is used when the user toggles "Use Activities metadata" in the GUI.
         """
         if not timestamp_str:
             return []
 
-        # We only care about the date part, so we split on whitespace.
-        first_part = timestamp_str.split(" ")[0]
+        # Extract date portion (everything before the first space)
+        date_part = timestamp_str.split(" ")[0]
+
         try:
-            msg_date = datetime.datetime.strptime(first_part, "%Y-%m-%d").date()
+            msg_date = datetime.datetime.strptime(date_part, "%Y-%m-%d").date()
         except Exception:
-            # If we can't parse the date, we just say "no related activities".
+            # If we cannot parse it, we say there are no related events.
             return []
 
-        matches = [
-            ev for ev in self.activities_events
-            if ev.date == msg_date
-        ]
+        matches = [ev for ev in self.activities_events if ev.date == msg_date]
         return matches
