@@ -9,7 +9,10 @@ This module is intentionally GUI-agnostic:
 - It knows how to:
     * Locate and parse the `Messages/index.json` file inside the export.
     * Discover channel folders under `Messages/` and their `messages.json` files.
-    * Read `channel.json` in each channel folder to determine type (DM vs server).
+    * Read `channel.json` in each channel folder to determine type (DM vs server)
+      and the list of participants (recipients).
+    * Optionally read Account/user.json to learn the current user's ID and
+      map friend/user IDs to display names (via the "relationships" list).
     * Load messages for a specific channel on demand.
     * Extract important fields from each message:
         - ID
@@ -28,7 +31,7 @@ from __future__ import annotations
 import os
 import json
 import datetime
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +69,10 @@ class ChannelEntry:
         The classification is primarily driven by channel.json["type"], with a
         fallback heuristic based on the label.
 
+    recipients : List[str]
+        List of user IDs participating in this channel, as reported in
+        channel.json["recipients"]. For server channels this may be empty.
+
     has_attachments : bool
         Whether any message in this channel appears to contain a non-empty
         "Attachments" field. This supports the "channels with attachments only"
@@ -78,12 +85,14 @@ class ChannelEntry:
         label: str,
         path: str,
         kind: str,
-        has_attachments: bool,
+        recipients: Optional[List[str]] = None,
+        has_attachments: bool = False,
     ) -> None:
         self.id = channel_id
         self.label = label
         self.path = path
         self.kind = kind
+        self.recipients: List[str] = recipients or []
         self.has_attachments = has_attachments
 
 
@@ -125,8 +134,9 @@ class DiscordExportModel:
     ----------------
     - Resolving the export root directory.
     - Discovering channels under `Messages/`.
-    - Reading `channel.json` to determine DM vs server.
+    - Reading `channel.json` to determine DM vs server and track recipients.
     - Exposing channel metadata to the GUI.
+    - Building DM "conversations" grouped by participants.
     - Loading and parsing `messages.json` files.
     - Offering helpers for extracting message fields.
     - Providing a global search across all messages.
@@ -149,6 +159,19 @@ class DiscordExportModel:
         # Activity metadata loaded from Activity/:
         self.activities_events: List[ActivityEvent] = []
 
+        # Current user's ID and display name (from Account/user.json, if available)
+        # This lets us treat your own ID specially in DM labels ("you").
+        self.own_user_id: Optional[str] = None
+        self.own_display_name: Optional[str] = None
+
+        # Mapping from user ID -> display name (friends/contacts etc.)
+        # Derived from Account/user.json["relationships"].
+        self.user_display_names: Dict[str, str] = {}
+
+        # Grouped DM conversations:
+        #   key: tuple(sorted(participant_ids)) -> list of ChannelEntry
+        self._dm_conversations: Dict[Tuple[str, ...], List[ChannelEntry]] = {}
+
     # =====================================================================
     # Export scanning / initialization
     # =====================================================================
@@ -159,11 +182,14 @@ class DiscordExportModel:
 
         This method:
         - Resets any previous state.
+        - Reads Account/user.json (if present) to learn the current user ID
+          and build a mapping of friend IDs to display names.
         - Scans the `Messages/` directory to find channels and messages files.
         - Parses `Messages/index.json` (if present) to assign human-readable
           names to channels.
         - Reads each `Messages/<channel_id>/channel.json` to determine whether
-          the channel is a DM or server channel.
+          the channel is a DM or server channel and what participants are.
+        - Builds grouped DM conversations based on participant sets.
         - Best-effort loads activity metadata from `Activity/` (if present).
 
         Parameters
@@ -177,6 +203,15 @@ class DiscordExportModel:
         self.channels.clear()
         self.index_labels.clear()
         self.activities_events.clear()
+        self.own_user_id = None
+        self.own_display_name = None
+        self.user_display_names.clear()
+        self._dm_conversations.clear()
+
+        # ------------------------------------------------------------------
+        # 0) Load account user info (to know "you" + map friend IDs -> names)
+        # ------------------------------------------------------------------
+        self._load_account_user(folder)
 
         # ------------------------------------------------------------------
         # 1) Validate and locate Messages directory
@@ -221,8 +256,9 @@ class DiscordExportModel:
             # Human-readable label from index.json (if present)
             label = self.index_labels.get(channel_id, f"{channel_id} (unknown)")
 
-            # Try to read channel.json for an explicit "type"
+            # Try to read channel.json for an explicit "type" and "recipients"
             channel_json_type: Optional[str] = None
+            recipients: List[str] = []
             channel_json_path = os.path.join(channel_folder, "channel.json")
             if os.path.isfile(channel_json_path):
                 try:
@@ -232,9 +268,13 @@ class DiscordExportModel:
                         t_val = ch_data.get("type")
                         if t_val is not None:
                             channel_json_type = str(t_val)
+                        rec = ch_data.get("recipients", [])
+                        if isinstance(rec, list):
+                            recipients = [str(r) for r in rec]
                 except Exception:
                     # If channel.json is weird, we just ignore it.
                     channel_json_type = None
+                    recipients = []
 
             # Classify as DM or server, using type first, then label heuristic
             kind = self._classify_kind(label, channel_json_type)
@@ -247,13 +287,77 @@ class DiscordExportModel:
                 label=label,
                 path=messages_json_path,
                 kind=kind,
+                recipients=recipients,
                 has_attachments=has_attachments,
             )
 
         # ------------------------------------------------------------------
-        # 4) Load Activities metadata from Activity/ (optional)
+        # 4) Build DM conversation groups (by participant sets)
+        # ------------------------------------------------------------------
+        self._build_dm_conversations()
+
+        # ------------------------------------------------------------------
+        # 5) Load Activities metadata from Activity/ (optional)
         # ------------------------------------------------------------------
         self._load_activities(folder)
+
+    # =====================================================================
+    # Account/user.json helpers
+    # =====================================================================
+
+    def _load_account_user(self, root: str) -> None:
+        """
+        Load Account/user.json, if present, to learn:
+
+        - The current user's ID and display name.
+        - A mapping from "relationship" user IDs to display names.
+
+        This helps us produce nicer labels for DM conversations.
+        """
+        account_user_path = os.path.join(root, "Account", "user.json")
+        if not os.path.isfile(account_user_path):
+            return
+
+        try:
+            with open(account_user_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        # Current user
+        own_id = data.get("id")
+        if own_id is not None:
+            self.own_user_id = str(own_id)
+        # We prefer global_name, then username
+        own_name = data.get("global_name") or data.get("username")
+        if own_name:
+            self.own_display_name = str(own_name)
+        elif self.own_user_id:
+            self.own_display_name = self.own_user_id
+
+        # Build mapping of other user IDs -> display names via "relationships"
+        relationships = data.get("relationships", [])
+        if isinstance(relationships, list):
+            for rel in relationships:
+                if not isinstance(rel, dict):
+                    continue
+                u = rel.get("user")
+                if not isinstance(u, dict):
+                    continue
+                uid = u.get("id")
+                if uid is None:
+                    continue
+                uid_str = str(uid)
+                disp_name = u.get("global_name") or u.get("username")
+                if disp_name:
+                    self.user_display_names[uid_str] = str(disp_name)
+
+        # Make sure we can label ourselves too
+        if self.own_user_id and self.own_display_name:
+            self.user_display_names[self.own_user_id] = self.own_display_name
 
     # =====================================================================
     # Channel helpers
@@ -283,7 +387,8 @@ class DiscordExportModel:
 
         Discord export samples show things like:
             {"id": "...", "type": "DM", "recipients": [...]}
-        so we treat "DM" (case-insensitive) as direct messages.
+        so we treat "DM" (case-insensitive) and similar markers as direct
+        messages.
         """
         # 1) Try explicit channel type from channel.json
         if channel_type is not None:
@@ -342,6 +447,101 @@ class DiscordExportModel:
                 return True
 
         return False
+
+    # =====================================================================
+    # DM conversation grouping
+    # =====================================================================
+
+    def _build_dm_conversations(self) -> None:
+        """
+        Build grouped DM conversations:
+
+        Each DM ChannelEntry has a list of participant user IDs (recipients).
+        We form a key from the sorted participant IDs so that multiple DM
+        channels involving the same set of participants are grouped together.
+        """
+        convs: Dict[Tuple[str, ...], List[ChannelEntry]] = {}
+
+        for ch in self.channels.values():
+            if ch.kind != "dm":
+                continue
+
+            # If no recipients info, fall back to a unique key so the channel
+            # is not merged incorrectly with others.
+            if ch.recipients:
+                key = tuple(sorted(ch.recipients))
+            else:
+                key = (ch.id,)
+
+            convs.setdefault(key, []).append(ch)
+
+        self._dm_conversations = convs
+
+    def get_dm_conversations(self) -> Dict[Tuple[str, ...], List[ChannelEntry]]:
+        """
+        Return the mapping of DM conversation groups:
+
+        key: tuple(sorted(participant_ids))
+        value: list of ChannelEntry objects (one per underlying channel).
+        """
+        return self._dm_conversations
+
+    def format_dm_conversation_label(
+        self,
+        participants_key: Tuple[str, ...],
+        channels: List[ChannelEntry],
+    ) -> str:
+        """
+        Produce a human-friendly label for a DM conversation group.
+
+        We try to show something like:
+            - "DM with Alice"
+            - "DM with Alice, Bob"
+            - "Group DM: Alice, Bob, Charlie"
+            - Falling back to raw IDs if we don't know names.
+
+        Parameters
+        ----------
+        participants_key : Tuple[str, ...]
+            Sorted tuple of user IDs (as strings).
+
+        channels : List[ChannelEntry]
+            Underlying channels for this conversation group (not used heavily
+            here, but available if you want to incorporate channel labels).
+        """
+        if not participants_key:
+            return "DM (unknown participants)"
+
+        names: List[str] = []
+        for uid in participants_key:
+            if self.own_user_id and uid == self.own_user_id:
+                names.append("you")
+            else:
+                disp = self.user_display_names.get(uid)
+                if disp:
+                    names.append(disp)
+                else:
+                    names.append(uid)
+
+        # We try to separate "you" from others for nicer phrasing.
+        others = [n for n in names if n != "you"]
+
+        if not others:
+            # Only "you" in the list? Odd, but handle it.
+            return "DM (with yourself)"
+
+        # Single-participant DM (you + one person)
+        if len(others) == 1:
+            return f"DM with {others[0]}"
+
+        # Small group
+        if len(others) <= 3:
+            return "Group DM: " + ", ".join(others)
+
+        # Larger group: show first two and count the rest
+        first_two = ", ".join(others[:2])
+        remaining = len(others) - 2
+        return f"Group DM: {first_two}, … (+{remaining} more)"
 
     # =====================================================================
     # Messages loading and field extraction
