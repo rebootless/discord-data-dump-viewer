@@ -10,7 +10,7 @@ Features
     * Channel list: colored icons per channel type (DM vs Server).
     * Messages table: Type column has colored icons + text.
 - Three-pane layout:
-    * Left: Channel list + filters (All / DM / Server, attachments-only, sorting).
+    * Left: Channel list + filters (All / DM / Server, attachments-only, DM grouping).
     * Top-right: Messages table + search/filter/sort/export.
     * Bottom-right: JSON details + inline image preview for attachments.
 - Attachment dialog integration:
@@ -22,6 +22,11 @@ Features
     * "Preview only image-like URLs" toggle (extension-based heuristic).
     * "Auto-preview first attachment when selecting a message (if image-like)".
     * "Save previewed image…" button to write the currently previewed image to disk.
+- DM grouping helpers:
+    * Uses channel.json["recipients"] and Account/user.json relationships to
+      derive human-readable conversation labels ("DM with Alice", etc.).
+    * Optional "Group direct messages by participants" toggle that merges
+      multiple DM channels with the same participant set into a single view.
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from __future__ import annotations
 import csv
 import json
 import os
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Tuple, Union
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor
@@ -79,7 +84,7 @@ class DiscordExportViewer(QMainWindow):
         # ------------- Window basics -------------
         self.setWindowTitle(
             "Discord JSON Export Viewer "
-            "(Messages + DM/Server + Attachments + Global Search + Activities)"
+            "(Messages + DM/Server + Grouped DMs + Attachments + Global Search + Activities)"
         )
         self.resize(1700, 950)
 
@@ -89,11 +94,15 @@ class DiscordExportViewer(QMainWindow):
         # Channel filter mode: "all", "dm", "server"
         self.current_channel_filter: str = "all"
 
-        # Currently selected channel ID & kind
+        # Currently selected channel context:
+        # - If viewing a single channel: current_channel_id is set to its ID.
+        # - If viewing a grouped DM conversation: current_channel_id is None,
+        #   and current_group_channel_ids holds the list of underlying IDs.
         self.current_channel_id: Optional[str] = None
+        self.current_group_channel_ids: List[str] = []
         self.current_channel_kind: str = ""
 
-        # Messages for the selected channel
+        # Messages for the current selection
         self.current_messages_unfiltered: List[JsonObject] = []
         self.current_messages: List[JsonObject] = []
 
@@ -112,6 +121,9 @@ class DiscordExportViewer(QMainWindow):
         self.preview_only_images_checkbox: Optional[QCheckBox] = None
         self.auto_preview_checkbox: Optional[QCheckBox] = None
         self.btn_save_preview: Optional[QPushButton] = None
+
+        # DM grouping toggle
+        self.group_dm_checkbox: Optional[QCheckBox] = None
 
         # ------------- Build UI -------------
         self._init_menu_bar()
@@ -184,6 +196,7 @@ class DiscordExportViewer(QMainWindow):
 
         LEFT:
             - Filters for channel type and attachments.
+            - Optional DM grouping.
             - Channel list (with colored DM/Server icons).
 
         RIGHT (vertical splitter):
@@ -231,6 +244,13 @@ class DiscordExportViewer(QMainWindow):
             self.on_channel_attachments_filter_changed
         )
         left_layout.addWidget(self.channel_attachments_only_checkbox)
+
+        # DM grouping toggle
+        self.group_dm_checkbox = QCheckBox(
+            "Group direct messages by participants"
+        )
+        self.group_dm_checkbox.toggled.connect(self.on_group_dm_toggled)
+        left_layout.addWidget(self.group_dm_checkbox)
 
         # Channel sorting buttons
         channel_sort_layout = QHBoxLayout()
@@ -391,13 +411,13 @@ class DiscordExportViewer(QMainWindow):
         )
         self.preview_only_images_checkbox.setChecked(True)
 
-        # NEW: checkbox for auto-preview
+        # checkbox for auto-preview
         self.auto_preview_checkbox = QCheckBox(
             "Auto-preview first attachment when selecting a message (if image-like)"
         )
         self.auto_preview_checkbox.setChecked(False)
 
-        # NEW: button to save the currently previewed image
+        # button to save the currently previewed image
         self.btn_save_preview = QPushButton("Save previewed image…")
         self.btn_save_preview.clicked.connect(self.save_current_preview)
 
@@ -473,6 +493,7 @@ class DiscordExportViewer(QMainWindow):
 
         # Reset current state in the viewer
         self.current_channel_id = None
+        self.current_group_channel_ids = []
         self.current_channel_kind = ""
         self.current_messages_unfiltered = []
         self.current_messages = []
@@ -505,49 +526,130 @@ class DiscordExportViewer(QMainWindow):
         Populate channel list from model, respecting:
         - current_channel_filter (All / DM / Server)
         - channel_attachments_only_checkbox
+        - group_dm_checkbox
 
         DM / Server entries are decorated with colored icons.
+
+        In grouped-DM mode:
+            - DMs are grouped by participant set.
+            - Each DM group item stores:
+                {
+                    "mode": "dm_group",
+                    "participants_key": [...],
+                    "channel_ids": [...]
+                }
+        In normal mode:
+            - Each item stores:
+                {
+                    "mode": "single",
+                    "channel_id": "..."
+                }
         """
-        # Clear whatever is currently in the list widget
         self.channel_list_widget.clear()
 
-        # If the model has no channels yet, nothing to show
         if not self.model.channels:
             return
 
-        # Whether we only want channels which contain at least one attachment
         attachments_only = self.channel_attachments_only_checkbox.isChecked()
+        group_dm = self.group_dm_checkbox.isChecked() if self.group_dm_checkbox else False
 
-        # Use model.get_channel_entries() (sorted list of ChannelEntry)
-        channel_entries = self.model.get_channel_entries()
+        if group_dm:
+            # ------------- Grouped DM mode -------------
+            # First, add grouped DM conversations if filter allows DMs
+            if self.current_channel_filter in ("all", "dm"):
+                dm_convs = self.model.get_dm_conversations()
 
-        for ch in channel_entries:
-            # Filter by DM / server type
-            if self.current_channel_filter != "all" and ch.kind != self.current_channel_filter:
-                continue
+                dm_items: List[QListWidgetItem] = []
+                for participants_key, channels in dm_convs.items():
+                    # attachments filter: skip if no underlying channel has attachments
+                    if attachments_only and not any(ch.has_attachments for ch in channels):
+                        continue
 
-            # Filter by "only channels with attachments"
-            if attachments_only and not ch.has_attachments:
-                continue
+                    label = self.model.format_dm_conversation_label(
+                        participants_key, channels
+                    )
+                    # Show channel count if > 1 so you know it's merged
+                    if len(channels) > 1:
+                        label = f"{label} ({len(channels)} channels)"
 
-            # Label text shown in the sidebar list
-            text = f"{ch.label} [{ch.id}]"
-            item = QListWidgetItem(text)
+                    item = QListWidgetItem(label)
 
-            # Store the channel ID in the item so we can retrieve it later
-            item.setData(Qt.ItemDataRole.UserRole, ch.id)
+                    data: Dict[str, Any] = {
+                        "mode": "dm_group",
+                        "participants_key": list(participants_key),
+                        "channel_ids": [ch.id for ch in channels],
+                    }
+                    item.setData(Qt.ItemDataRole.UserRole, data)
 
-            # Color + icon by type
-            if ch.kind == "dm":
-                if self.dm_icon is not None:
-                    item.setIcon(self.dm_icon)
-                item.setForeground(QColor(0, 180, 255))
-            else:
-                if self.server_icon is not None:
-                    item.setIcon(self.server_icon)
-                item.setForeground(QColor(0, 220, 0))
+                    # DM icon & color
+                    if self.dm_icon is not None:
+                        item.setIcon(self.dm_icon)
+                    item.setForeground(QColor(0, 180, 255))
 
-            self.channel_list_widget.addItem(item)
+                    dm_items.append(item)
+
+                # Sort DM groups by label
+                dm_items.sort(key=lambda it: it.text().lower())
+                for it in dm_items:
+                    self.channel_list_widget.addItem(it)
+
+            # Next, add server channels if filter allows
+            if self.current_channel_filter in ("all", "server"):
+                server_entries = [
+                    ch for ch in self.model.get_channel_entries()
+                    if ch.kind == "server"
+                ]
+                for ch in server_entries:
+                    if attachments_only and not ch.has_attachments:
+                        continue
+
+                    text = f"{ch.label} [{ch.id}]"
+                    item = QListWidgetItem(text)
+                    data = {
+                        "mode": "single",
+                        "channel_id": ch.id,
+                    }
+                    item.setData(Qt.ItemDataRole.UserRole, data)
+
+                    if self.server_icon is not None:
+                        item.setIcon(self.server_icon)
+                    item.setForeground(QColor(0, 220, 0))
+
+                    self.channel_list_widget.addItem(item)
+
+        else:
+            # ------------- Normal (non-grouped) mode -------------
+            channel_entries = self.model.get_channel_entries()
+
+            for ch in channel_entries:
+                # Filter by DM / server type
+                if self.current_channel_filter != "all" and ch.kind != self.current_channel_filter:
+                    continue
+
+                # Filter by "only channels with attachments"
+                if attachments_only and not ch.has_attachments:
+                    continue
+
+                text = f"{ch.label} [{ch.id}]"
+                item = QListWidgetItem(text)
+
+                data = {
+                    "mode": "single",
+                    "channel_id": ch.id,
+                }
+                item.setData(Qt.ItemDataRole.UserRole, data)
+
+                # Color + icon by type
+                if ch.kind == "dm":
+                    if self.dm_icon is not None:
+                        item.setIcon(self.dm_icon)
+                    item.setForeground(QColor(0, 180, 255))
+                else:
+                    if self.server_icon is not None:
+                        item.setIcon(self.server_icon)
+                    item.setForeground(QColor(0, 220, 0))
+
+                self.channel_list_widget.addItem(item)
 
     def on_channel_filter_changed(self, index: int) -> None:
         """
@@ -578,6 +680,21 @@ class DiscordExportViewer(QMainWindow):
         else:
             self.show_status_message("Showing all channels (attachments or not).")
 
+    def on_group_dm_toggled(self, checked: bool) -> None:
+        """
+        Toggle between:
+            - Individual DM channels
+            - Grouped DM conversations (by participant sets)
+        """
+        self.populate_channel_list()
+        self.clear_messages()
+        self.details_text_edit.clear()
+        self._clear_image_preview()
+        if checked:
+            self.show_status_message("Grouping direct messages by participants.")
+        else:
+            self.show_status_message("Showing individual channels (no grouping).")
+
     def sort_channels_az(self) -> None:
         self.channel_list_widget.sortItems(Qt.SortOrder.AscendingOrder)
 
@@ -588,63 +705,182 @@ class DiscordExportViewer(QMainWindow):
     # Channel selection
     # ==================================================================
 
+    def _decode_channel_item_data(self, item: QListWidgetItem) -> Tuple[str, List[str], str]:
+        """
+        Internal helper to interpret the data stored in a channel list item.
+
+        Returns a triple:
+            (mode, channel_ids, logical_kind)
+
+        - mode is either "single" or "dm_group".
+        - channel_ids is a list of underlying channel IDs.
+        - logical_kind is "dm" or "server" from the perspective of how we
+          display messages in the table.
+        """
+        raw = item.data(Qt.ItemDataRole.UserRole)
+        mode = "single"
+        channel_ids: List[str] = []
+        logical_kind = "server"
+
+        if isinstance(raw, dict):
+            mode = raw.get("mode", "single")
+            if mode == "dm_group":
+                ch_ids = raw.get("channel_ids", [])
+                channel_ids = [str(cid) for cid in ch_ids]
+                logical_kind = "dm"
+            else:
+                cid = raw.get("channel_id")
+                if cid is not None:
+                    channel_ids = [str(cid)]
+                # Determine logical kind from model if possible
+                if channel_ids and channel_ids[0] in self.model.channels:
+                    logical_kind = self.model.channels[channel_ids[0]].kind
+        else:
+            # Backward-compat: raw is just a string channel_id
+            if isinstance(raw, str):
+                mode = "single"
+                channel_ids = [raw]
+                if raw in self.model.channels:
+                    logical_kind = self.model.channels[raw].kind
+
+        return mode, channel_ids, logical_kind
+
     def on_channel_selected(self) -> None:
         """
-        When the user selects a channel in the list, load its messages from
-        the model and display them in the table.
+        When the user selects a channel (or DM group) in the list, load its
+        messages from the model and display them in the table.
+
+        - Single channel: we show only that channel's messages.
+        - DM group: we merge messages from all underlying DM channels,
+          then sort them by timestamp.
         """
         items = self.channel_list_widget.selectedItems()
         if not items:
             return
 
         item = items[0]
-        channel_id = item.data(Qt.ItemDataRole.UserRole)
-        if not isinstance(channel_id, str):
+        mode, channel_ids, logical_kind = self._decode_channel_item_data(item)
+
+        if not channel_ids:
             return
 
-        if channel_id not in self.model.channels:
-            return
+        if mode == "single":
+            # Normal single-channel behavior
+            channel_id = channel_ids[0]
+            if channel_id not in self.model.channels:
+                return
 
-        entry = self.model.channels[channel_id]
+            entry = self.model.channels[channel_id]
 
-        # Load messages from the model
-        try:
-            messages = self.model.load_channel_messages(channel_id)
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Error Loading messages.json",
-                f"Could not load messages for channel {channel_id}:\n"
-                f"{entry.path}\n\nError: {exc}",
+            # Load messages from the model
+            try:
+                messages = self.model.load_channel_messages(channel_id)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Error Loading messages.json",
+                    f"Could not load messages for channel {channel_id}:\n"
+                    f"{entry.path}\n\nError: {exc}",
+                )
+                self.show_status_message("Failed to load messages.")
+                return
+
+            self.current_channel_id = channel_id
+            self.current_group_channel_ids = []
+            self.current_channel_kind = entry.kind
+            self.current_messages_unfiltered = messages
+            self.current_messages = list(messages)
+
+            # Apply any existing filters
+            self.apply_message_filters(from_search=False)
+
+            label = entry.label
+            self.show_status_message(
+                f"Loaded {len(messages)} messages from channel: {label} [{channel_id}]",
+                timeout_ms=8000,
             )
-            self.show_status_message("Failed to load messages.")
-            return
 
-        self.current_channel_id = channel_id
-        self.current_channel_kind = entry.kind
-        self.current_messages_unfiltered = messages
-        self.current_messages = list(messages)
+            self._clear_image_preview()
 
-        # Apply any existing filters (search text + attachments-only)
-        self.apply_message_filters(from_search=False)
+            hint = (
+                f"Channel: {label} [{channel_id}]\n"
+                f"Messages file: {entry.path}\n"
+                f"Total messages loaded: {len(messages)}\n\n"
+                "Use search, attachments-only, sort, Activities toggle, and global search as needed.\n"
+                "Select a row to see full JSON. Double-click 'Yes' in 'Attachments?' "
+                "to view and preview URLs."
+            )
+            self.details_text_edit.setPlainText(hint)
+        else:
+            # Grouped DM conversation: merge messages from all underlying channels
+            merged_messages: List[JsonObject] = []
+            total_count = 0
 
-        label = entry.label
-        self.show_status_message(
-            f"Loaded {len(messages)} messages from channel: {label} [{channel_id}]",
-            timeout_ms=8000,
-        )
+            for cid in channel_ids:
+                if cid not in self.model.channels:
+                    continue
+                entry = self.model.channels[cid]
+                try:
+                    msgs = self.model.load_channel_messages(cid)
+                except Exception:
+                    msgs = []
+                total_count += len(msgs)
+                # Annotate each message with its channel-id/label for reference
+                for msg in msgs:
+                    if isinstance(msg, dict):
+                        msg = dict(msg)
+                        msg["_channel_id"] = cid
+                        msg["_channel_label"] = entry.label
+                    merged_messages.append(msg)
 
-        self._clear_image_preview()
+            # Sort merged messages by timestamp string (simple lexicographic sort,
+            # which works OK for ISO-like datetime formats)
+            merged_messages.sort(
+                key=lambda m: self.model.extract_message_timestamp(m)
+            )
 
-        hint = (
-            f"Channel: {label} [{channel_id}]\n"
-            f"Messages file: {entry.path}\n"
-            f"Total messages loaded: {len(messages)}\n\n"
-            "Use search, attachments-only, sort, Activities toggle, and global search as needed.\n"
-            "Select a row to see full JSON. Double-click 'Yes' in 'Attachments?' "
-            "to view and preview URLs."
-        )
-        self.details_text_edit.setPlainText(hint)
+            self.current_channel_id = None
+            self.current_group_channel_ids = list(channel_ids)
+            self.current_channel_kind = "dm"
+            self.current_messages_unfiltered = merged_messages
+            self.current_messages = list(merged_messages)
+
+            # Apply filters
+            self.apply_message_filters(from_search=False)
+
+            # Build a friendly label for details pane
+            # We can try to reconstruct participants_key from item data:
+            raw = item.data(Qt.ItemDataRole.UserRole)
+            participants_key = []
+            if isinstance(raw, dict):
+                pk = raw.get("participants_key", [])
+                participants_key = [str(x) for x in pk]
+
+            label = "Grouped DM conversation"
+            if participants_key:
+                label = self.model.format_dm_conversation_label(
+                    tuple(participants_key), []
+                )
+
+            self.show_status_message(
+                f"Loaded grouped DM: {label} "
+                f"(merged {total_count} messages from {len(channel_ids)} channels)",
+                timeout_ms=9000,
+            )
+            self._clear_image_preview()
+
+            details = (
+                f"{label}\n"
+                f"Underlying channel IDs: {', '.join(channel_ids)}\n"
+                f"Total messages loaded (before filters): {total_count}\n\n"
+                "Use search, attachments-only, sort, Activities toggle, and global search as needed.\n"
+                "Select a row to see full JSON. Double-click 'Yes' in 'Attachments?' "
+                "to view and preview URLs.\n\n"
+                "Each message in the JSON view may include:\n"
+                '  "_channel_id": original channel ID\n'
+                '  "_channel_label": original channel label\n'
+            )
+            self.details_text_edit.setPlainText(details)
 
     # ==================================================================
     # Messages table population & helpers
@@ -887,7 +1123,7 @@ class DiscordExportViewer(QMainWindow):
         If "Search across all message JSON files" is checked:
             -> perform global search across all channels (opens dialog).
         Otherwise:
-            -> filter the messages of the currently selected channel.
+            -> filter the messages of the currently selected channel/group.
         """
         if self.search_all_channels_checkbox.isChecked():
             self.on_global_search_clicked()
@@ -953,27 +1189,36 @@ class DiscordExportViewer(QMainWindow):
         Called by GlobalSearchDialog when the user double-clicks a result row.
 
         This method:
-        1. Finds the channel in the left list and selects it (loading messages).
+        1. Finds the channel or DM-group in the left list and selects it
+           (loading messages).
         2. Locates the row with the specified message ID in the table and selects it.
         """
-        # Step 1: select channel in the list
         target_item: Optional[QListWidgetItem] = None
+
         for i in range(self.channel_list_widget.count()):
             item = self.channel_list_widget.item(i)
-            cid = item.data(Qt.ItemDataRole.UserRole)
-            if str(cid) == str(channel_id):
-                target_item = item
-                break
+            mode, channel_ids, _logical_kind = self._decode_channel_item_data(item)
+
+            if mode == "single":
+                if channel_ids and str(channel_ids[0]) == str(channel_id):
+                    target_item = item
+                    break
+            else:
+                # DM group: see if the requested channel_id is one of the group's channels
+                if any(str(cid) == str(channel_id) for cid in channel_ids):
+                    target_item = item
+                    break
 
         if not target_item:
             QMessageBox.warning(
                 self,
                 "Jump to Message",
                 f"Could not find channel {channel_id} in the current filter view.\n"
-                "Try adjusting the channel filters (DM/Server/attachments).",
+                "Try adjusting the channel filters (DM/Server/attachments or DM grouping).",
             )
             return
 
+        # Selecting the item triggers on_channel_selected() which loads messages
         self.channel_list_widget.setCurrentItem(target_item)
 
         # Step 2: after load, find message row
