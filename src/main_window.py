@@ -501,45 +501,58 @@ class DiscordExportViewer(QMainWindow):
     # ==================================================================
 
     def populate_channel_list(self) -> None:
-        """
-        Populate channel list from model, respecting:
-        - current_channel_filter (All / DM / Server)
-        - channel_attachments_only_checkbox
+    """
+    Populate channel list from model, respecting:
+    - current_channel_filter (All / DM / Server)
+    - channel_attachments_only_checkbox
 
-        DM / Server entries are decorated with colored icons.
-        """
-        self.channel_list_widget.clear()
+    DM / Server entries are decorated with colored icons.
+    """
+    # Clear whatever is currently in the list widget
+    self.channel_list_widget.clear()
 
-        if not self.model.channels:
-            return
+    # If the model has no channels yet, nothing to show
+    if not self.model.channels:
+        return
 
-        attachments_only = self.channel_attachments_only_checkbox.isChecked()
+    # Whether we only want channels which contain at least one attachment
+    attachments_only = self.channel_attachments_only_checkbox.isChecked()
 
-        for ch in self.model.get_channel_entries():
-            # Filter by DM/server
-            if self.current_channel_filter != "all" and ch.kind != self.current_channel_filter:
-                continue
+    # Instead of calling self.model.get_channel_entries(), we iterate
+    # directly over the model's channels dict and sort by label.
+    channel_entries = sorted(
+        self.model.channels.values(),
+        key=lambda ch: ch.label.lower(),
+    )
 
-            # Filter by attachments
-            if attachments_only and not ch.has_attachments:
-                continue
+    for ch in channel_entries:
+        # Filter by DM / server type
+        if self.current_channel_filter != "all" and ch.kind != self.current_channel_filter:
+            continue
 
-            text = f"{ch.label} [{ch.id}]"
-            item = QListWidgetItem(text)
-            # Store channel_id; we can look up ChannelEntry via model.channels
-            item.setData(Qt.ItemDataRole.UserRole, ch.id)
+        # Filter by "only channels with attachments"
+        if attachments_only and not ch.has_attachments:
+            continue
 
-            # Color + icon by type
-            if ch.kind == "dm":
-                if self.dm_icon is not None:
-                    item.setIcon(self.dm_icon)
-                item.setForeground(QColor(0, 180, 255))
-            else:
-                if self.server_icon is not None:
-                    item.setIcon(self.server_icon)
-                item.setForeground(QColor(0, 220, 0))
+        # Label text shown in the sidebar list
+        text = f"{ch.label} [{ch.id}]"
+        item = QListWidgetItem(text)
 
-            self.channel_list_widget.addItem(item)
+        # Store the channel ID in the item so we can retrieve it later
+        item.setData(Qt.ItemDataRole.UserRole, ch.id)
+
+        # Color + icon by type
+        if ch.kind == "dm":
+            if self.dm_icon is not None:
+                item.setIcon(self.dm_icon)
+            item.setForeground(QColor(0, 180, 255))
+        else:
+            if self.server_icon is not None:
+                item.setIcon(self.server_icon)
+            item.setForeground(QColor(0, 220, 0))
+
+        self.channel_list_widget.addItem(item)
+
 
     def on_channel_filter_changed(self, index: int) -> None:
         """
