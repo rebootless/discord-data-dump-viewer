@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import datetime
 from typing import List, Dict, Optional, Any, Tuple
 
@@ -627,12 +628,106 @@ class DiscordExportModel:
         return "No"
 
     @staticmethod
+    def local_attachment_filename(url: str) -> str:
+        """
+        Reproduce the filename that `discord-dl` (rebootless/discord-dl) uses
+        when it downloads a Discord CDN attachment URL to disk.
+
+        discord-dl's `download_one()` names the file with plain Bash
+        `basename "$url"`, which only splits on the last "/" and does NOT
+        strip query strings. So for a signed CDN URL like:
+
+            https://cdn.discordapp.com/attachments/<ch>/<id>/name.png?ex=..&is=..&hm=..
+
+        the file on disk is literally named:
+
+            name.png?ex=..&is=..&hm=..
+
+        We must replicate that exactly (not urlparse-based extension
+        stripping) to find the matching local file.
+        """
+        if not url:
+            return url
+        return url.rsplit("/", 1)[-1]
+
+    def get_channel_dir(self, channel_id: str) -> Optional[str]:
+        """Return the folder containing `messages.json` for `channel_id`."""
+        entry = self.channels.get(channel_id)
+        if entry is None:
+            return None
+        return os.path.dirname(entry.path)
+
+    def resolve_local_attachment_path(
+        self, url: str, channel_id: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Try to find a locally saved copy of a `cdn.discordapp.com` attachment,
+        as downloaded by `discord-dl` into `<channel_dir>/attachments/`.
+
+        Used as a fallback when the (expiring, signed) remote URL can no
+        longer be resolved.
+
+        Parameters
+        ----------
+        url : str
+            The original attachment URL from the "Attachments" field.
+        channel_id : Optional[str]
+            The channel the message belongs to, if known. If omitted (or
+            not found), we try to recover it from the URL itself
+            (".../attachments/<channel_id>/<attachment_id>/<filename>").
+
+        Returns
+        -------
+        Optional[str]
+            Absolute path to the local file if found, else None.
+        """
+        filename = self.local_attachment_filename(url)
+        if not filename:
+            return None
+
+        # Build the ordered list of channel dirs to check.
+        candidate_dirs: List[str] = []
+
+        if channel_id is not None:
+            d = self.get_channel_dir(channel_id)
+            if d:
+                candidate_dirs.append(d)
+
+        # Fall back to parsing the channel id out of the CDN URL itself
+        # (cdn.discordapp.com/attachments/<channel_id>/<attachment_id>/<file>).
+        try:
+            from urllib.parse import urlparse
+
+            parts = [p for p in urlparse(url).path.split("/") if p]
+            if len(parts) >= 3 and parts[0] == "attachments":
+                url_channel_id = parts[1]
+                for cid in (url_channel_id, f"c{url_channel_id}"):
+                    d = self.get_channel_dir(cid)
+                    if d and d not in candidate_dirs:
+                        candidate_dirs.append(d)
+        except Exception:
+            pass
+
+        for channel_dir in candidate_dirs:
+            candidate = os.path.join(channel_dir, "attachments", filename)
+            if os.path.isfile(candidate):
+                return candidate
+
+        return None
+
+    @staticmethod
     def extract_attachments_list(msg: JsonObject) -> List[str]:
         """
         Extract the list of attachment URLs / file paths from a message.
 
-        Many Discord export tools store attachments as a single comma-separated
-        string. Here we convert that into a list of trimmed entries.
+        The "Attachments" field can hold multiple entries. Different export
+        tools have used different separators for this — some use commas,
+        but the schema this app targets (and what `discord-dl` itself
+        expects, see its `tr ' ' '\\n'` step) separates multiple attachment
+        URLs with whitespace. We split on any run of commas and/or
+        whitespace so a message with several attachments doesn't get
+        collapsed into a single malformed "URL" containing embedded spaces
+        (which crashes urllib with "control characters" errors).
 
         Returns
         -------
@@ -642,7 +737,7 @@ class DiscordExportModel:
         att = msg.get("Attachments", "")
         if not isinstance(att, str):
             return []
-        parts = [a.strip() for a in att.split(",") if a.strip()]
+        parts = [p for p in re.split(r"[,\s]+", att) if p.strip()]
         return parts
 
     # =====================================================================

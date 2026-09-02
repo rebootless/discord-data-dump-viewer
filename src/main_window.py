@@ -36,7 +36,7 @@ import json
 import os
 from typing import List, Optional, Dict, Any, Tuple, Union
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QEvent
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor
 from PyQt6.QtWidgets import (
     QMainWindow,
@@ -60,6 +60,8 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QComboBox,
     QCheckBox,
+    QApplication,
+    QScrollArea,
 )
 
 from models import (
@@ -111,7 +113,20 @@ class DiscordExportViewer(QMainWindow):
 
         # Inline image preview
         self.image_preview_label: Optional[QLabel] = None
+        self.image_preview_scroll: Optional[QScrollArea] = None
         self._preview_pixmap: Optional[QPixmap] = None
+
+        # Zoom multiplier applied on top of the "fit to view" base scale.
+        # 1.0 == fully fit inside the preview viewport; wheel-zoom adjusts
+        # this, panning is done via the scroll area's scrollbars.
+        self._preview_zoom: float = 1.0
+        self._preview_min_zoom: float = 0.05
+        self._preview_max_zoom: float = 20.0
+
+        # Message currently backing the preview pane (used to resolve which
+        # channel/attachments folder to fall back to when a remote CDN URL
+        # can no longer be resolved, e.g. an expired signed link).
+        self._preview_context_msg: Optional[JsonObject] = None
 
         # DM vs Server icons
         self.dm_icon: Optional[QIcon] = None
@@ -399,11 +414,24 @@ class DiscordExportViewer(QMainWindow):
             "when you double-click an attachment URL."
         )
         self.image_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_preview_label.setMinimumWidth(350)
         self.image_preview_label.setWordWrap(True)
         self.image_preview_label.setStyleSheet(
-            "QLabel { border: 1px solid #666; background-color: #111; color: #aaa; }"
+            "QLabel { background-color: #111; color: #aaa; }"
         )
+
+        self.image_preview_scroll = QScrollArea()
+        self.image_preview_scroll.setWidget(self.image_preview_label)
+        self.image_preview_scroll.setWidgetResizable(True)
+        self.image_preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_preview_scroll.setMinimumWidth(350)
+        self.image_preview_scroll.setMinimumHeight(300)
+        self.image_preview_scroll.setStyleSheet(
+            "QScrollArea { border: 1px solid #666; background-color: #111; }"
+        )
+        # Wheel-to-zoom: intercept wheel events on the viewport so scrolling
+        # the mouse wheel over the image zooms it instead of scrolling.
+        # Panning a zoomed-in image is done via the scrollbars.
+        self.image_preview_scroll.viewport().installEventFilter(self)
 
         # Checkbox: "Preview only image-like URLs"
         self.preview_only_images_checkbox = QCheckBox(
@@ -422,7 +450,7 @@ class DiscordExportViewer(QMainWindow):
         self.btn_save_preview.clicked.connect(self.save_current_preview)
 
         # Layout the preview controls under the preview label
-        preview_layout.addWidget(self.image_preview_label)
+        preview_layout.addWidget(self.image_preview_scroll)
         preview_layout.addWidget(self.preview_only_images_checkbox)
         preview_layout.addWidget(self.auto_preview_checkbox)
         preview_layout.addWidget(self.btn_save_preview)
@@ -1008,6 +1036,7 @@ class DiscordExportViewer(QMainWindow):
         if self.auto_preview_checkbox is not None and self.auto_preview_checkbox.isChecked():
             attachments = self.model.extract_attachments_list(msg)
             if attachments:
+                self._preview_context_msg = msg
                 # If "preview only images" is on, pick the first image-like URL
                 if self.preview_only_images_checkbox is not None and self.preview_only_images_checkbox.isChecked():
                     candidate_urls = [
@@ -1050,7 +1079,10 @@ class DiscordExportViewer(QMainWindow):
             return
 
         # When the user double-clicks a URL in the dialog, we want to preview
-        # the image inline in the image preview pane.
+        # the image inline in the image preview pane. Remember which message
+        # these URLs belong to, so show_image_from_url() can fall back to the
+        # locally-downloaded copy (via discord-dl) if the remote URL fails.
+        self._preview_context_msg = msg
         dlg = AttachmentViewerDialog(
             parent=self,
             urls=urls,
@@ -1235,16 +1267,30 @@ class DiscordExportViewer(QMainWindow):
     # Inline image preview
     # ==================================================================
 
+    def _show_preview_placeholder(self, text: str) -> None:
+        """
+        Show a centered text message in the preview pane (used for the
+        empty state and for "Loading..." feedback), with no pixmap.
+        """
+        self._preview_pixmap = None
+        self._preview_zoom = 1.0
+        if self.image_preview_scroll is not None:
+            # Let the label auto-fill the viewport while showing text; image
+            # mode switches this to False so it can be zoomed/scrolled.
+            self.image_preview_scroll.setWidgetResizable(True)
+        if self.image_preview_label is not None:
+            self.image_preview_label.setMinimumSize(0, 0)
+            self.image_preview_label.setMaximumSize(16777215, 16777215)  # release any fixed size
+            self.image_preview_label.setPixmap(QPixmap())
+            self.image_preview_label.setText(text)
+        self._update_preview_save_button_state()
+
     def _clear_image_preview(self) -> None:
         """Reset/clear the image preview pane and disable the save button."""
-        self._preview_pixmap = None
-        if self.image_preview_label is not None:
-            self.image_preview_label.setPixmap(QPixmap())
-            self.image_preview_label.setText(
-                "Image preview will appear here\n"
-                "when you double-click an attachment URL."
-            )
-        self._update_preview_save_button_state()
+        self._show_preview_placeholder(
+            "Image preview will appear here\n"
+            "when you double-click an attachment URL."
+        )
 
     @staticmethod
     def _looks_like_image_url(url: str) -> bool:
@@ -1278,6 +1324,24 @@ class DiscordExportViewer(QMainWindow):
         }
         return ext in image_exts
 
+    def _resolve_preview_channel_id(self) -> Optional[str]:
+        """
+        Best-effort: which channel does the message currently backing the
+        preview pane belong to? Used to locate its "attachments/" folder
+        for the local fallback below.
+        """
+        msg = self._preview_context_msg
+        if isinstance(msg, dict):
+            cid = msg.get("_channel_id")
+            if cid:
+                return str(cid)
+        return self.current_channel_id
+
+    # Network timeout (seconds) for fetching a remote attachment before we
+    # give up and fall back to the local discord-dl copy. Kept short since a
+    # dead/expired CDN link should fail fast rather than freeze the UI.
+    REMOTE_FETCH_TIMEOUT_SECONDS = 3
+
     def show_image_from_url(self, url: str) -> None:
         """
         Load an image from a URL or local path and display it in the preview pane.
@@ -1292,9 +1356,16 @@ class DiscordExportViewer(QMainWindow):
 
         Loading logic:
         - HTTP/HTTPS: download bytes via urllib.request.urlopen() and feed them
-          to QPixmap.loadFromData().
+          to QPixmap.loadFromData(). Discord CDN attachment links are signed
+          and expire ("ex="/"is="/"hm=" query params), so if the remote fetch
+          fails we fall back to the copy already saved locally by discord-dl
+          (https://github.com/rebootless/discord-dl) under
+          "<channel_dir>/attachments/".
         - Otherwise: treat as local path (absolute or relative to the export
           root folder).
+
+        While a remote fetch is in flight (or timing out), the preview pane
+        shows a "Loading..." placeholder instead of sitting blank/frozen.
         """
         if self.image_preview_label is None:
             return
@@ -1313,71 +1384,175 @@ class DiscordExportViewer(QMainWindow):
         from urllib.request import urlopen
 
         pixmap = QPixmap()
-        try:
-            if url.lower().startswith("http://") or url.lower().startswith("https://"):
-                # Remote image
-                with urlopen(url) as resp:
+        is_remote = url.lower().startswith("http://") or url.lower().startswith("https://")
+        loaded_from = url
+
+        if is_remote:
+            # Show a loading placeholder in the preview pane and force a
+            # repaint before the blocking network call below.
+            self._show_preview_placeholder(f"Loading image…\n{url}")
+            QApplication.processEvents()
+
+            remote_error: Optional[BaseException] = None
+            try:
+                with urlopen(url, timeout=self.REMOTE_FETCH_TIMEOUT_SECONDS) as resp:
                     data = resp.read()
                 if not pixmap.loadFromData(data):
                     raise RuntimeError("Unable to load image data from URL.")
-            else:
-                # Local file (absolute or relative to root folder)
-                if self.model.root_folder and not os.path.isabs(url):
-                    candidate = os.path.join(self.model.root_folder, url)
-                else:
-                    candidate = url
+            except Exception as exc:
+                # Catch-all is intentional here: a malformed/expired CDN URL
+                # can raise all sorts of things (urllib.error.*, OSError,
+                # socket.timeout, http.client.InvalidURL, ValueError, ...),
+                # and any of them should fall back to the local copy instead
+                # of crashing the app.
+                remote_error = exc
+                pixmap = QPixmap()  # reset before trying the local fallback
 
-                if not pixmap.load(candidate):
-                    raise RuntimeError(
-                        f"Unable to load image file from path:\n{candidate}"
+            if remote_error is not None:
+                # Remote fetch failed (typically an expired signed CDN link).
+                # Fall back to the locally-downloaded copy, if we have one.
+                self.image_preview_label.setText(f"Loading local fallback…\n{url}")
+                QApplication.processEvents()
+
+                local_path = self.model.resolve_local_attachment_path(
+                    url, self._resolve_preview_channel_id()
+                )
+                if local_path and pixmap.load(local_path):
+                    loaded_from = local_path
+                    self.show_status_message(
+                        "Remote attachment unavailable (link likely expired); "
+                        f"showing local copy instead: {local_path}",
+                        timeout_ms=8000,
                     )
-        except Exception as exc:
-            # Only shout loudly if the user has explicitly disabled the
-            # "preview only image-like URLs" safeguard; otherwise they'd
-            # already have been filtered out above.
-            QMessageBox.warning(
-                self,
-                "Image Preview",
-                f"Failed to load image from:\n{url}\n\nError: {exc}",
-            )
-            return
+                else:
+                    self._clear_image_preview()
+                    QMessageBox.warning(
+                        self,
+                        "Image Preview",
+                        f"Failed to load image from:\n{url}\n\nError: {remote_error}\n\n"
+                        "No local fallback copy was found either (expected under "
+                        "'<channel>/attachments/' if downloaded via discord-dl).",
+                    )
+                    return
+        else:
+            # Local file (absolute or relative to root folder)
+            if self.model.root_folder and not os.path.isabs(url):
+                candidate = os.path.join(self.model.root_folder, url)
+            else:
+                candidate = url
+
+            if not pixmap.load(candidate):
+                QMessageBox.warning(
+                    self,
+                    "Image Preview",
+                    f"Unable to load image file from path:\n{candidate}",
+                )
+                return
+            loaded_from = candidate
 
         if pixmap.isNull():
             QMessageBox.warning(
                 self,
                 "Image Preview",
-                f"Loaded data from:\n{url}\n\n"
+                f"Loaded data from:\n{loaded_from}\n\n"
                 "but QPixmap reports it as null (not a supported image?).",
             )
             return
 
         self._preview_pixmap = pixmap
+        self._preview_zoom = 1.0  # reset zoom whenever a new image is loaded
         self._update_preview_label()
-        self.show_status_message(f"Previewing image from: {url}", timeout_ms=5000)
+        self.show_status_message(f"Previewing image from: {loaded_from}", timeout_ms=5000)
 
     def _update_preview_label(self) -> None:
         """
-        Scale and display the stored preview pixmap on the preview label,
-        and update the save-button enabled state.
+        Scale the stored preview pixmap to fit the preview viewport times the
+        current zoom factor, and display it. Uses the scroll area's viewport
+        size (not the label's own size) as the "fit" baseline, since the
+        label itself is resized to match the zoomed image so it can be
+        scrolled/panned when larger than the visible area.
         """
-        if self.image_preview_label is None or self._preview_pixmap is None:
+        if (
+            self.image_preview_label is None
+            or self.image_preview_scroll is None
+            or self._preview_pixmap is None
+        ):
             self._update_preview_save_button_state()
             return
 
-        # Keep aspect ratio and fill as much as we can
-        target_size = self.image_preview_label.size()
-        if target_size.width() <= 0 or target_size.height() <= 0:
+        viewport_size = self.image_preview_scroll.viewport().size()
+        pixmap_size = self._preview_pixmap.size()
+        if (
+            viewport_size.width() <= 0
+            or viewport_size.height() <= 0
+            or pixmap_size.width() <= 0
+            or pixmap_size.height() <= 0
+        ):
             self._update_preview_save_button_state()
             return
+
+        # "Fit" scale: the largest scale at which the whole image still fits
+        # inside the viewport. The user's zoom multiplier is applied on top,
+        # so zoom == 1.0 always means "fit to the preview pane".
+        fit_scale = min(
+            viewport_size.width() / pixmap_size.width(),
+            viewport_size.height() / pixmap_size.height(),
+        )
+        effective_scale = max(fit_scale * self._preview_zoom, 0.01)
+
+        target_w = max(1, round(pixmap_size.width() * effective_scale))
+        target_h = max(1, round(pixmap_size.height() * effective_scale))
 
         scaled = self._preview_pixmap.scaled(
-            target_size,
+            target_w,
+            target_h,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+
+        # Fixed-size label inside a non-resizable scroll area: this is what
+        # makes scrollbars appear (and panning work) once the zoomed image
+        # is bigger than the visible viewport.
+        self.image_preview_scroll.setWidgetResizable(False)
+        self.image_preview_label.setFixedSize(scaled.size())
         self.image_preview_label.setPixmap(scaled)
         self.image_preview_label.setText("")  # Clear placeholder text
         self._update_preview_save_button_state()
+
+    def eventFilter(self, obj, event) -> bool:
+        """
+        Intercept wheel events over the image preview viewport to zoom the
+        image in/out instead of scrolling.
+        """
+        if (
+            self.image_preview_scroll is not None
+            and obj is self.image_preview_scroll.viewport()
+            and event.type() == QEvent.Type.Wheel
+        ):
+            self._on_preview_wheel(event)
+            return True
+        return super().eventFilter(obj, event)
+
+    def _on_preview_wheel(self, event) -> None:
+        """Adjust the preview zoom factor in response to a wheel event."""
+        if self._preview_pixmap is None:
+            return
+
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+
+        zoom_step = 1.15
+        factor = zoom_step if delta > 0 else (1.0 / zoom_step)
+        new_zoom = max(
+            self._preview_min_zoom, min(self._preview_max_zoom, self._preview_zoom * factor)
+        )
+        if abs(new_zoom - self._preview_zoom) < 1e-6:
+            return
+
+        self._preview_zoom = new_zoom
+        self._update_preview_label()
+        self.show_status_message(f"Zoom: {self._preview_zoom * 100:.0f}%", timeout_ms=2000)
 
     def _update_preview_save_button_state(self) -> None:
         """
